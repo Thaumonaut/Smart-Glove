@@ -2,6 +2,26 @@
 # This is required for ESP-IDF framework
 
 idf_component_register(
-    SRCS "main.cpp"
-    INCLUDE_DIRS "."
+    SRCS
+        "main.cpp"
+        "display.cpp"
+        "bluetooth.cpp"
+        "sensors/mpu6050.cpp"
+        "sensors/analog_sensors.cpp"
+        "sensors/sensor_manager.cpp"
+        "gestures/gesture_detector.cpp"
+        "audio/audio_manager.cpp"
+        "ui/ui_manager.cpp"
+    INCLUDE_DIRS
+        "."
+        "sensors"
+        "gestures"
+        "audio"
+        "ui"
+    REQUIRES
+        esp_adc
+        driver
+        nvs_flash
+        bt
+        lvgl
 )

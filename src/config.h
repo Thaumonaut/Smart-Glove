@@ -16,9 +16,10 @@
 
 // Speaker output (MAX98357A on I2S port 0)
 #define I2S_SPKR_DO_IO  25  // Data Out to speaker amp
+#define I2S_GAIN_PIN    5   // GAIN control pin (HIGH=15dB, LOW=9dB, Float=12dB)
 
 // Microphone input (INMP441 on I2S port 1)
-#define I2S_MIC_DI_IO   32  // Data In from microphone
+#define I2S_MIC_DI_IO   32  // Data In from microphone (changed from 33)
 
 // I2S Port assignments
 #define I2S_PORT_SPEAKER    I2S_NUM_0
@@ -34,12 +35,12 @@
 // ============================================================================
 #define I2C_SDA_IO      21  // Data line
 #define I2C_SCL_IO      22  // Clock line
-#define I2C_FREQ_HZ     400000  // 400kHz fast mode
+#define I2C_FREQ_HZ     100000  // 100kHz standard mode (reduced for reliability)
 
 // I2C Device Addresses (verify with i2c scanner if needed)
 #define APDS9960_ADDR   0x39  // Gesture/proximity sensor
 #define MAX30102_ADDR   0x57  // Heart rate/O2 sensor
-#define MPU6050_ADDR    0x68  // Gyro/Accelerometer (HW-123)
+#define MPU6050_ADDR    0x68  // Gyro/Accelerometer (HW-123) - can be 0x69 if AD0 is HIGH
 
 // ============================================================================
 // ANALOG INPUTS (Flex Sensors & Pressure Pads)
@@ -50,7 +51,7 @@
 #define FLEX_PINKY_PIN      34  // ADC1_CH6 - Pinky finger
 
 #define PRESSURE_PAD_PIN    35  // ADC1_CH7 - Main pressure pad (gesture activation)
-#define PRESSURE_PAD2_PIN   33  // ADC1_CH5 - Optional second pad
+#define PRESSURE_PAD2_PIN   -1  // Disabled (GPIO 33 used for mic)
 
 // ADC configuration
 #define ADC_ATTEN       ADC_ATTEN_DB_11  // 0-3.3V range
@@ -66,19 +67,26 @@
 // ============================================================================
 // DIGITAL GPIO PINS
 // ============================================================================
-#define VIBRATION_MOTOR_PIN     23  // Haptic feedback motor (PWM capable)
+#define VIBRATION_MOTOR_PIN     19  // Haptic feedback motor (PWM capable)
 
 // Future expansion pins (available if needed)
-#define GPIO_SPARE_1    19
-#define GPIO_SPARE_2    18
-#define GPIO_SPARE_3    5
+#define GPIO_SPARE_1    16
+#define GPIO_SPARE_2    17
 
 // ============================================================================
 // DISPLAY CONFIGURATION (IdeaSpark integrated display)
 // ============================================================================
-// IdeaSpark has built-in display - pins are pre-configured on board
-// Typically uses SPI interface, exact pins depend on IdeaSpark schematic
-// TODO: Verify actual pins from IdeaSpark documentation
+// IdeaSpark ESP32 with ST7789 1.14" TFT display (135x240)
+#define TFT_MOSI        23
+#define TFT_SCLK        18
+#define TFT_CS          15
+#define TFT_DC          2
+#define TFT_RST         4
+#define TFT_BL          32  // Backlight
+
+// Display resolution for ST7789 1.14" display
+#define TFT_WIDTH       135
+#define TFT_HEIGHT      240
 
 // ============================================================================
 // BLUETOOTH CONFIGURATION
