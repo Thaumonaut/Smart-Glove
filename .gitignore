@@ -39,3 +39,29 @@
 
 # debug information files
 *.dwo
+
+# PlatformIO
+.pio/
+.vscode/
+.pio
+build/
+
+# ESP-IDF
+sdkconfig
+sdkconfig.old
+dependencies.lock
+
+# CLion
+.idea/
+cmake-build-*/
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
