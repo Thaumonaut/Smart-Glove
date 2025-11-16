@@ -6,6 +6,9 @@
 // Initialize Bluetooth A2DP sink and HFP
 void bluetooth_init(void);
 
+// Initialize microphone for HFP (call after audio_manager_init)
+void bluetooth_init_microphone(void);
+
 // Get connection status
 bool bluetooth_is_connected(void);
 bool bluetooth_is_playing_audio(void);

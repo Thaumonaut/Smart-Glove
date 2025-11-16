@@ -10,16 +10,17 @@
 // ============================================================================
 // I2S AUDIO PINS (MAX98357A Speaker + INMP441 Microphone)
 // ============================================================================
-// Shared clock signals between mic and speaker
-#define I2S_BCK_IO      27  // Bit Clock (shared)
-#define I2S_WS_IO       26  // Word Select / LRC (shared)
-
 // Speaker output (MAX98357A on I2S port 0)
+#define I2S_SPKR_BCK_IO 27  // Speaker Bit Clock
+#define I2S_SPKR_WS_IO  26  // Speaker Word Select / LRC
 #define I2S_SPKR_DO_IO  25  // Data Out to speaker amp
 #define I2S_GAIN_PIN    5   // GAIN control pin (HIGH=15dB, LOW=9dB, Float=12dB)
 
-// Microphone input (INMP441 on I2S port 1)
-#define I2S_MIC_DI_IO   32  // Data In from microphone (changed from 33)
+// Microphone input (INMP441 on I2S port 1 - SEPARATE CLOCKS)
+// User has mic physically wired to GPIO16/17, NOT shared with speaker
+#define I2S_MIC_BCK_IO  16  // Microphone Bit Clock (separate from speaker)
+#define I2S_MIC_WS_IO   17  // Microphone Word Select (separate from speaker)
+#define I2S_MIC_DI_IO   32  // Data In from microphone
 
 // I2S Port assignments
 #define I2S_PORT_SPEAKER    I2S_NUM_0
@@ -29,6 +30,10 @@
 #define I2S_SAMPLE_RATE     16000   // 16kHz for voice (can go up to 44.1kHz)
 #define I2S_BITS_PER_SAMPLE 16      // 16-bit audio
 #define I2S_CHANNELS        1       // Mono
+
+// Backward compatibility aliases (legacy code)
+#define I2S_BCK_IO      I2S_SPKR_BCK_IO
+#define I2S_WS_IO       I2S_SPKR_WS_IO
 
 // ============================================================================
 // I2C BUS (Shared by multiple sensors)
@@ -70,8 +75,9 @@
 #define VIBRATION_MOTOR_PIN     19  // Haptic feedback motor (PWM capable)
 
 // Future expansion pins (available if needed)
-#define GPIO_SPARE_1    16
-#define GPIO_SPARE_2    17
+// GPIO 16 & 17 now used for microphone I2S
+#define GPIO_SPARE_1    13
+#define GPIO_SPARE_2    19  // Can share with vibration motor if needed
 
 // ============================================================================
 // DISPLAY CONFIGURATION (IdeaSpark integrated display)

@@ -11,6 +11,7 @@ idf_component_register(
         "sensors/sensor_manager.cpp"
         "gestures/gesture_detector.cpp"
         "audio/audio_manager.cpp"
+        "audio/mic_manager.cpp"
         "ui/ui_manager.cpp"
     INCLUDE_DIRS
         "."
@@ -24,4 +25,5 @@ idf_component_register(
         nvs_flash
         bt
         lvgl
+        esp_audio_codec
 )

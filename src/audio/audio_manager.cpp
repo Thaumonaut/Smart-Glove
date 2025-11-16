@@ -6,6 +6,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/i2s.h"
+#include "driver/gpio.h"
 #include "esp_log.h"
 #include "../config.h"
 
@@ -49,29 +50,31 @@ esp_err_t audio_manager_init(void) {
     gpio_set_level((gpio_num_t)I2S_GAIN_PIN, 1);  // HIGH = 15dB (loudest)
     ESP_LOGI(TAG, "*** MAX98357A GAIN pin: GPIO5 = HIGH (15dB gain - MAXIMUM) ***");
     
-    // I2S configuration for speaker (port 0) - for Bluetooth audio
-    // Optimized for breadboard: slower edges, more tolerance for signal integrity issues
+    // I2S configuration for speaker (port 0)
+    // TDM Mode: Shares BCK/WS clocks with mic (port 1) via GPIO matrix
+    // DMA handles data transfer without CPU intervention
     i2s_config_t i2s_speaker_config = {
-        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
-        .sample_rate = 44100,
+        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),  // Master generates clocks
+        .sample_rate = 44100,  // 44.1kHz for music/A2DP (mic will match & downsample)
         .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
         .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
         .communication_format = (i2s_comm_format_t)(I2S_COMM_FORMAT_STAND_I2S),
         .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-        .dma_buf_count = 16,    // More buffers for stable playback
-        .dma_buf_len = 512,     // Moderate buffer size (16*512 = 8KB total)
-        .use_apll = false,      // Disable APLL - use simpler PLL (less sensitive to noise)
+        .dma_buf_count = 8,    // 8 DMA buffers for smooth playback
+        .dma_buf_len = 256,    // 256 samples/buffer = ~6ms latency per buffer
+        .use_apll = false,     // Standard PLL (must match mic for TDM sync)
         .tx_desc_auto_clear = true,
         .fixed_mclk = 0,
-        .mclk_multiple = I2S_MCLK_MULTIPLE_256,  // 256x MCLK (11.2896 MHz)
+        .mclk_multiple = I2S_MCLK_MULTIPLE_256,
         .bits_per_chan = I2S_BITS_PER_CHAN_16BIT
     };
 
     i2s_pin_config_t speaker_pin_config = {
-        .bck_io_num = I2S_BCK_IO,
-        .ws_io_num = I2S_WS_IO,
-        .data_out_num = I2S_SPKR_DO_IO,
-        .data_in_num = I2S_PIN_NO_CHANGE
+        .mck_io_num = I2S_PIN_NO_CHANGE,
+        .bck_io_num = I2S_BCK_IO,        // Master clock output (shared)
+        .ws_io_num = I2S_WS_IO,          // Master WS output (shared)
+        .data_out_num = I2S_SPKR_DO_IO,  // Speaker data only
+        .data_in_num = I2S_PIN_NO_CHANGE // No RX on this port
     };
 
     esp_err_t ret = i2s_driver_install(I2S_PORT_SPEAKER, &i2s_speaker_config, 0, NULL);
@@ -87,6 +90,13 @@ esp_err_t audio_manager_init(void) {
         return ret;
     }
     ESP_LOGI(TAG, "*** I2S pins: BCK=GPIO%d, WS=GPIO%d, DOUT=GPIO%d ***", I2S_BCK_IO, I2S_WS_IO, I2S_SPKR_DO_IO);
+    
+    // CRITICAL FIX: Increase drive strength on clock pins to fix signal integrity
+    // Without this, clock signals can be weak/unstable with long wires
+    gpio_set_drive_capability((gpio_num_t)I2S_BCK_IO, GPIO_DRIVE_CAP_3);   // BCK: Max drive (40mA)
+    gpio_set_drive_capability((gpio_num_t)I2S_WS_IO, GPIO_DRIVE_CAP_3);    // WS: Max drive (40mA)
+    gpio_set_drive_capability((gpio_num_t)I2S_SPKR_DO_IO, GPIO_DRIVE_CAP_3); // DOUT: Max drive
+    ESP_LOGI(TAG, "*** Clock pins set to maximum drive strength (40mA) ***");
     
     // Set I2S clock for better audio quality
     i2s_set_clk(I2S_PORT_SPEAKER, 44100, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO);

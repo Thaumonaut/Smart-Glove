@@ -193,6 +193,10 @@ extern "C" void app_main(void) {
     
     // Initialize audio after Bluetooth
     audio_manager_init();
+    
+    // Initialize microphone for HFP uplink (uses different clock source than speaker)
+    bluetooth_init_microphone();
+    
     ui_manager_init();
     
     // Update display with initial Bluetooth status (now that display is ready)
