@@ -21,10 +21,11 @@ static lv_disp_t *disp;
 
 // UI elements
 static lv_obj_t *label_title;
+static lv_obj_t *label_bt_status;
+static lv_obj_t *label_track_info;
 static lv_obj_t *label_accel_x;
 static lv_obj_t *label_accel_y;
 static lv_obj_t *label_accel_z;
-static lv_obj_t *label_bt_status;
 static lv_obj_t *label_message;
 
 // SPI device handle
@@ -226,37 +227,47 @@ void display_init(void) {
     label_title = lv_label_create(scr);
     lv_label_set_text(label_title, "Smart Glove");
     lv_obj_set_style_text_color(label_title, lv_color_white(), 0);
-    // Slightly lower the title to avoid clipping at the top of some modules
-    lv_obj_align(label_title, LV_ALIGN_TOP_MID, 0, 8);
+    lv_obj_set_style_text_font(label_title, &lv_font_montserrat_14, 0);
+    lv_obj_align(label_title, LV_ALIGN_TOP_MID, 0, 5);
 
-    // Bluetooth status
+    // Bluetooth status (connection indicator)
     label_bt_status = lv_label_create(scr);
-    lv_label_set_text(label_bt_status, "BT: Waiting...\nSmartGlove");
+    lv_label_set_text(label_bt_status, "BT: Waiting...");
     lv_obj_set_style_text_color(label_bt_status, lv_color_make(255, 200, 100), 0);
     lv_obj_set_style_text_align(label_bt_status, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(label_bt_status, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_align(label_bt_status, LV_ALIGN_TOP_MID, 0, 25);
 
-    // Accelerometer values
+    // Track info (title and artist for music, or call status)
+    label_track_info = lv_label_create(scr);
+    lv_label_set_text(label_track_info, "");
+    lv_obj_set_style_text_color(label_track_info, lv_color_make(150, 220, 255), 0);
+    lv_obj_set_style_text_align(label_track_info, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(label_track_info, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_obj_set_width(label_track_info, TFT_WIDTH - 10);
+    lv_obj_align(label_track_info, LV_ALIGN_TOP_MID, 0, 45);
+
+    // Accelerometer values (smaller, at bottom)
     label_accel_x = lv_label_create(scr);
-    lv_label_set_text(label_accel_x, "X: 0");
+    lv_label_set_text(label_accel_x, "X:0");
     lv_obj_set_style_text_color(label_accel_x, lv_color_make(100, 200, 255), 0);
-    lv_obj_align(label_accel_x, LV_ALIGN_CENTER, 0, -10);
+    lv_obj_align(label_accel_x, LV_ALIGN_BOTTOM_LEFT, 5, -25);
 
     label_accel_y = lv_label_create(scr);
-    lv_label_set_text(label_accel_y, "Y: 0");
+    lv_label_set_text(label_accel_y, "Y:0");
     lv_obj_set_style_text_color(label_accel_y, lv_color_make(100, 255, 100), 0);
-    lv_obj_align(label_accel_y, LV_ALIGN_CENTER, 0, 15);
+    lv_obj_align(label_accel_y, LV_ALIGN_BOTTOM_MID, 0, -25);
 
     label_accel_z = lv_label_create(scr);
-    lv_label_set_text(label_accel_z, "Z: 0");
+    lv_label_set_text(label_accel_z, "Z:0");
     lv_obj_set_style_text_color(label_accel_z, lv_color_make(255, 200, 100), 0);
-    lv_obj_align(label_accel_z, LV_ALIGN_CENTER, 0, 40);
+    lv_obj_align(label_accel_z, LV_ALIGN_BOTTOM_RIGHT, -5, -25);
 
     // Message label
     label_message = lv_label_create(scr);
     lv_label_set_text(label_message, "");
     lv_obj_set_style_text_color(label_message, lv_color_white(), 0);
-    lv_obj_align(label_message, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_text_align(label_message, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(label_message, LV_ALIGN_BOTTOM_MID, 0, -5);
 
     ESP_LOGI(TAG, "Display initialized successfully");
 }
@@ -280,23 +291,52 @@ void display_set_offsets(int x_offset, int y_offset) {
 void display_update_accel(int16_t x, int16_t y, int16_t z) {
     char buf[32];
 
-    snprintf(buf, sizeof(buf), "X: %d", x);
+    snprintf(buf, sizeof(buf), "X:%d", x);
     lv_label_set_text(label_accel_x, buf);
 
-    snprintf(buf, sizeof(buf), "Y: %d", y);
+    snprintf(buf, sizeof(buf), "Y:%d", y);
     lv_label_set_text(label_accel_y, buf);
 
-    snprintf(buf, sizeof(buf), "Z: %d", z);
+    snprintf(buf, sizeof(buf), "Z:%d", z);
     lv_label_set_text(label_accel_z, buf);
 }
 
-void display_set_bluetooth_status(bool connected) {
-    if (connected) {
+void display_update_bluetooth_state(bool connected, bool playing, bool in_call,
+                                     const char *track_title, const char *track_artist) {
+    // Update connection status
+    if (!connected) {
+        lv_label_set_text(label_bt_status, "BT: Waiting...");
+        lv_obj_set_style_text_color(label_bt_status, lv_color_make(255, 200, 100), 0);
+        lv_label_set_text(label_track_info, "SmartGlove");
+        lv_obj_set_style_text_color(label_track_info, lv_color_make(150, 150, 150), 0);
+    } else if (in_call) {
+        lv_label_set_text(label_bt_status, "BT: CALL");
+        lv_obj_set_style_text_color(label_bt_status, lv_color_make(255, 100, 100), 0);
+        lv_label_set_text(label_track_info, "Phone Call\nActive");
+        lv_obj_set_style_text_color(label_track_info, lv_color_make(255, 150, 150), 0);
+    } else if (playing) {
+        lv_label_set_text(label_bt_status, "BT: PLAYING");
+        lv_obj_set_style_text_color(label_bt_status, lv_color_make(100, 255, 100), 0);
+        
+        // Show track info if available
+        if (track_title && track_title[0] != '\0') {
+            char info_buf[256];
+            if (track_artist && track_artist[0] != '\0') {
+                snprintf(info_buf, sizeof(info_buf), "%s\n%s", track_title, track_artist);
+            } else {
+                snprintf(info_buf, sizeof(info_buf), "%s", track_title);
+            }
+            lv_label_set_text(label_track_info, info_buf);
+            lv_obj_set_style_text_color(label_track_info, lv_color_make(150, 220, 255), 0);
+        } else {
+            lv_label_set_text(label_track_info, "Playing Music");
+            lv_obj_set_style_text_color(label_track_info, lv_color_make(150, 220, 255), 0);
+        }
+    } else {
         lv_label_set_text(label_bt_status, "BT: CONNECTED");
         lv_obj_set_style_text_color(label_bt_status, lv_color_make(100, 255, 100), 0);
-    } else {
-        lv_label_set_text(label_bt_status, "BT: Ready\nSmartGlove");
-        lv_obj_set_style_text_color(label_bt_status, lv_color_make(100, 200, 255), 0);
+        lv_label_set_text(label_track_info, "Ready");
+        lv_obj_set_style_text_color(label_track_info, lv_color_make(150, 220, 255), 0);
     }
 }
 

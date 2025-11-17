@@ -209,8 +209,14 @@ extern "C" void app_main(void) {
     
     ui_manager_init();
     
-    // Update display with initial Bluetooth status (now that display is ready)
-    display_set_bluetooth_status(bluetooth_is_connected());
+    // Initial display update
+    char title[128] = {0};
+    char artist[128] = {0};
+    bluetooth_get_track_info(title, sizeof(title), artist, sizeof(artist));
+    display_update_bluetooth_state(bluetooth_is_connected(), 
+                                   bluetooth_is_playing_audio(),
+                                   bluetooth_is_call_active(),
+                                   title, artist);
 
     // Start all tasks
     ESP_LOGI(TAG, "Starting tasks...");
@@ -233,6 +239,17 @@ extern "C" void app_main(void) {
                            sensors.motion.accel_y, 
                            sensors.motion.accel_z);
         }
+        
+        // Update Bluetooth status on display
+        char title[128] = {0};
+        char artist[128] = {0};
+        bool has_metadata = bluetooth_get_track_info(title, sizeof(title), artist, sizeof(artist));
+        
+        display_update_bluetooth_state(bluetooth_is_connected(),
+                                       bluetooth_is_playing_audio(),
+                                       bluetooth_is_call_active(),
+                                       has_metadata ? title : NULL,
+                                       has_metadata ? artist : NULL);
         
         vTaskDelay(pdMS_TO_TICKS(1000));
     }

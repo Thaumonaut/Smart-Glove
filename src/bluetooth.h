@@ -2,6 +2,7 @@
 #define BLUETOOTH_H
 
 #include <stdbool.h>
+#include <stddef.h>  // For size_t
 
 // Initialize Bluetooth A2DP sink and HFP
 void bluetooth_init(void);
@@ -23,6 +24,9 @@ void bluetooth_use_hfp_queue(bool enable);
 // Get connection status
 bool bluetooth_is_connected(void);
 bool bluetooth_is_playing_audio(void);
+
+// Get track metadata (returns true if metadata available)
+bool bluetooth_get_track_info(char *title, size_t title_size, char *artist, size_t artist_size);
 
 // HFP (Hands-Free Profile) functions
 bool bluetooth_is_call_active(void);

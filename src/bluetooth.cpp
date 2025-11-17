@@ -13,6 +13,7 @@
 #include "esp_bt_device.h"
 #include "esp_gap_bt_api.h"
 #include "esp_a2dp_api.h"
+#include "esp_avrc_api.h"  // AVRC for metadata
 #include "esp_hf_client_api.h"  // HFP client API
 #include "driver/i2s.h"
 #include "driver/gpio.h"
@@ -67,6 +68,11 @@ static void hfp_log_buffer_info(const char *where, esp_hf_audio_buff_t *b) {
 // Bluetooth state
 static bool bt_connected = false;
 static bool audio_playing = false;
+
+// A2DP metadata state (AVRC - Audio/Video Remote Control)
+static char current_track_title[128] = {0};
+static char current_track_artist[128] = {0};
+static bool metadata_available = false;
 
 // HFP state
 // CRITICAL: Use volatile to prevent multi-core race conditions
@@ -815,6 +821,51 @@ static void bt_a2dp_data_cb(const uint8_t *data, uint32_t len) {
 }
 
 /**
+ * AVRC callback - handles metadata (track title, artist, etc.)
+ */
+static void bt_avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *param) {
+    switch (event) {
+        case ESP_AVRC_CT_METADATA_RSP_EVT: {
+            // ESP-IDF delivers metadata one attribute at a time
+            uint8_t attr_id = param->meta_rsp.attr_id;
+            const char *attr_text = (const char *)param->meta_rsp.attr_text;
+            int attr_len = param->meta_rsp.attr_length;
+            
+            if (!attr_text || attr_len == 0) {
+                break;
+            }
+            
+            if (attr_id == ESP_AVRC_MD_ATTR_TITLE) {
+                snprintf(current_track_title, sizeof(current_track_title), "%.*s", 
+                         attr_len, attr_text);
+                ESP_LOGI(TAG, "Track: %s", current_track_title);
+                metadata_available = true;
+            } else if (attr_id == ESP_AVRC_MD_ATTR_ARTIST) {
+                snprintf(current_track_artist, sizeof(current_track_artist), "%.*s", 
+                         attr_len, attr_text);
+                ESP_LOGI(TAG, "Artist: %s", current_track_artist);
+                metadata_available = true;
+            }
+            break;
+        }
+        
+        case ESP_AVRC_CT_CONNECTION_STATE_EVT:
+            ESP_LOGI(TAG, "AVRC connection state: %s", 
+                     param->conn_stat.connected ? "connected" : "disconnected");
+            break;
+            
+        case ESP_AVRC_CT_PASSTHROUGH_RSP_EVT:
+            ESP_LOGD(TAG, "AVRC passthrough response: key_code 0x%x, key_state %d",
+                     param->psth_rsp.key_code, param->psth_rsp.key_state);
+            break;
+            
+        default:
+            ESP_LOGD(TAG, "AVRC event: %d", event);
+            break;
+    }
+}
+
+/**
  * A2DP callback - handles connection state changes
  */
 static void bt_a2dp_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param) {
@@ -823,7 +874,6 @@ static void bt_a2dp_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param) {
             if (param->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
                 ESP_LOGI(TAG, "A2DP connected");
                 bt_connected = true;
-                display_set_bluetooth_status(true);
 
                 // Vibrate to confirm connection
                 gpio_set_level((gpio_num_t)VIBRATION_MOTOR_PIN, 1);
@@ -833,7 +883,9 @@ static void bt_a2dp_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param) {
                 ESP_LOGI(TAG, "A2DP disconnected");
                 bt_connected = false;
                 audio_playing = false;
-                display_set_bluetooth_status(false);
+                metadata_available = false;  // Clear metadata on disconnect
+                current_track_title[0] = '\0';
+                current_track_artist[0] = '\0';
                 display_show_message("");
             }
             break;
@@ -1244,12 +1296,18 @@ void bluetooth_init(void) {
     ESP_ERROR_CHECK(esp_bt_gap_register_callback(bt_gap_cb));
     ESP_ERROR_CHECK(esp_a2d_register_callback(bt_a2dp_cb));
     ESP_ERROR_CHECK(esp_a2d_sink_register_data_callback(bt_a2dp_data_cb));
+    ESP_ERROR_CHECK(esp_avrc_ct_register_callback(bt_avrc_ct_cb));  // Register AVRC callback
     ESP_LOGI(TAG, "Step 5: Callbacks registered");
 
     // Initialize A2DP sink
     ESP_LOGI(TAG, "Step 6: Initializing A2DP sink...");
     ESP_ERROR_CHECK(esp_a2d_sink_init());
     ESP_LOGI(TAG, "Step 6: A2DP sink initialized");
+    
+    // Initialize AVRC controller (for metadata)
+    ESP_LOGI(TAG, "Step 6b: Initializing AVRC controller...");
+    ESP_ERROR_CHECK(esp_avrc_ct_init());
+    ESP_LOGI(TAG, "Step 6b: AVRC controller initialized - metadata ready");
     
     // Initialize HFP (Hands-Free Profile)
     ESP_LOGI(TAG, "Step 7: Initializing HFP (Hands-Free Profile)...");
@@ -1406,6 +1464,21 @@ bool bluetooth_is_connected(void) {
 
 bool bluetooth_is_playing_audio(void) {
     return audio_playing;
+}
+
+bool bluetooth_get_track_info(char *title, size_t title_size, char *artist, size_t artist_size) {
+    if (!metadata_available) {
+        return false;
+    }
+    
+    if (title && title_size > 0) {
+        snprintf(title, title_size, "%s", current_track_title);
+    }
+    if (artist && artist_size > 0) {
+        snprintf(artist, artist_size, "%s", current_track_artist);
+    }
+    
+    return true;
 }
 
 // ============================================================================

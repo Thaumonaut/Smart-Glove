@@ -8,7 +8,8 @@ void display_init(void);
 
 // UI elements
 void display_update_accel(int16_t x, int16_t y, int16_t z);
-void display_set_bluetooth_status(bool connected);
+void display_update_bluetooth_state(bool connected, bool playing, bool in_call,
+                                     const char *track_title, const char *track_artist);
 void display_show_message(const char *message);
 
 // Optional: change hardware offsets at runtime if module needs manual tuning
