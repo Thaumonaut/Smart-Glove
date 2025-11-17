@@ -812,11 +812,11 @@ static void bt_a2dp_data_cb(const uint8_t *data, uint32_t len) {
         ESP_LOGI(TAG, "");
         ESP_LOGI(TAG, "========================================");
         ESP_LOGI(TAG, "*** AUDIO PLAYBACK STARTED ***");
+        ESP_LOGI(TAG, "*** audio_playing flag set to TRUE ***");
         ESP_LOGI(TAG, "*** Volume: 100%% (phone controls volume) ***");
         ESP_LOGI(TAG, "*** GAIN: 15dB (maximum output) ***");
         ESP_LOGI(TAG, "========================================");
         ESP_LOGI(TAG, "");
-        display_show_message("Playing audio");
     }
 }
 
@@ -872,7 +872,10 @@ static void bt_a2dp_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param) {
     switch (event) {
         case ESP_A2D_CONNECTION_STATE_EVT:
             if (param->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
-                ESP_LOGI(TAG, "A2DP connected");
+                ESP_LOGI(TAG, "========================================");
+                ESP_LOGI(TAG, "*** A2DP CONNECTED ***");
+                ESP_LOGI(TAG, "*** bt_connected flag set to TRUE ***");
+                ESP_LOGI(TAG, "========================================");
                 bt_connected = true;
 
                 // Vibrate to confirm connection
@@ -886,13 +889,14 @@ static void bt_a2dp_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param) {
                 metadata_available = false;  // Clear metadata on disconnect
                 current_track_title[0] = '\0';
                 current_track_artist[0] = '\0';
-                display_show_message("");
             }
             break;
 
         case ESP_A2D_AUDIO_STATE_EVT:
             if (param->audio_stat.state == ESP_A2D_AUDIO_STATE_STARTED) {
-                ESP_LOGI(TAG, "Audio streaming started");
+                ESP_LOGI(TAG, "========================================");
+                ESP_LOGI(TAG, "*** AUDIO STATE: STARTED ***");
+                ESP_LOGI(TAG, "========================================");
             } else if (param->audio_stat.state == ESP_A2D_AUDIO_STATE_STOPPED) {
                 ESP_LOGI(TAG, "Audio streaming stopped");
                 audio_playing = false;
@@ -1262,8 +1266,8 @@ void bluetooth_init(void) {
     }
     // Enable HFP debug trace by default to help catch HFP issues during development
     bluetooth_set_hfp_debug_logs(true);
-    // Reduce console noise by default: show only Mic/Bluetooth traces
-    bluetooth_enable_mic_trace_only(true);
+    // TEMPORARILY DISABLED: Reduce console noise by default: show only Mic/Bluetooth traces
+    // bluetooth_enable_mic_trace_only(true);  // This was hiding UIManager logs!
     ESP_LOGI(TAG, "Step 2: BT controller initialized successfully");
 
     ESP_LOGI(TAG, "Step 3: Enabling BT controller (BTDM mode - dual mode)...");

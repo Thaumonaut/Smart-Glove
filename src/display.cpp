@@ -157,6 +157,11 @@ static void disp_flush(lv_disp_drv_t *disp_drv, const lv_area_t *area, lv_color_
     int32_t w = area->x2 - area->x1 + 1;
     int32_t h = area->y2 - area->y1 + 1;
 
+    static uint32_t flush_count = 0;
+    if (++flush_count % 100 == 0) {  // Log every 100 flushes to avoid spam
+        ESP_LOGI(TAG, "Display flush #%d: x=%d y=%d w=%d h=%d", flush_count, (int)x, (int)y, (int)w, (int)h);
+    }
+
     st7789_set_addr_window(x, y, w, h);
     st7789_write_data_buf((uint8_t *)color_p, w * h * 2);
 
@@ -299,22 +304,37 @@ void display_update_accel(int16_t x, int16_t y, int16_t z) {
 
     snprintf(buf, sizeof(buf), "Z:%d", z);
     lv_label_set_text(label_accel_z, buf);
+    
+    // Force immediate screen refresh
+    lv_refr_now(NULL);
 }
 
 void display_update_bluetooth_state(bool connected, bool playing, bool in_call,
                                      const char *track_title, const char *track_artist) {
+    ESP_LOGI(TAG, "Display update called: conn=%d play=%d call=%d", connected, playing, in_call);
+    
+    // Check if labels are valid
+    if (!label_bt_status || !label_track_info) {
+        ESP_LOGE(TAG, "ERROR: Labels are NULL! bt_status=%p track_info=%p", 
+                 label_bt_status, label_track_info);
+        return;
+    }
+    
     // Update connection status
     if (!connected) {
+        ESP_LOGI(TAG, "Setting display to: Waiting...");
         lv_label_set_text(label_bt_status, "BT: Waiting...");
         lv_obj_set_style_text_color(label_bt_status, lv_color_make(255, 200, 100), 0);
         lv_label_set_text(label_track_info, "SmartGlove");
         lv_obj_set_style_text_color(label_track_info, lv_color_make(150, 150, 150), 0);
     } else if (in_call) {
+        ESP_LOGI(TAG, "Setting display to: CALL");
         lv_label_set_text(label_bt_status, "BT: CALL");
         lv_obj_set_style_text_color(label_bt_status, lv_color_make(255, 100, 100), 0);
         lv_label_set_text(label_track_info, "Phone Call\nActive");
         lv_obj_set_style_text_color(label_track_info, lv_color_make(255, 150, 150), 0);
     } else if (playing) {
+        ESP_LOGI(TAG, "Setting display to: PLAYING");
         lv_label_set_text(label_bt_status, "BT: PLAYING");
         lv_obj_set_style_text_color(label_bt_status, lv_color_make(100, 255, 100), 0);
         
@@ -333,11 +353,23 @@ void display_update_bluetooth_state(bool connected, bool playing, bool in_call,
             lv_obj_set_style_text_color(label_track_info, lv_color_make(150, 220, 255), 0);
         }
     } else {
+        ESP_LOGI(TAG, "Setting display to: CONNECTED");
         lv_label_set_text(label_bt_status, "BT: CONNECTED");
         lv_obj_set_style_text_color(label_bt_status, lv_color_make(100, 255, 100), 0);
         lv_label_set_text(label_track_info, "Ready");
         lv_obj_set_style_text_color(label_track_info, lv_color_make(150, 220, 255), 0);
     }
+    
+    // Force LVGL to redraw the labels
+    lv_obj_invalidate(label_bt_status);
+    lv_obj_invalidate(label_track_info);
+    
+    // Force immediate screen refresh to ensure display is updated
+    lv_refr_now(NULL);
+    
+    // Verify the text was actually set
+    const char *current_text = lv_label_get_text(label_bt_status);
+    ESP_LOGI(TAG, "Display update complete - label text now: '%s' (flushed)", current_text ? current_text : "NULL");
 }
 
 void display_show_message(const char *message) {

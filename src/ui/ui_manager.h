@@ -1,45 +1,23 @@
 /**
- * UI Manager
- * 
- * Manages LVGL display and user interface
+ * UI Manager - Display and User Interface
  */
 
 #ifndef UI_MANAGER_H
 #define UI_MANAGER_H
 
-#include <stdint.h>
 #include "esp_err.h"
+#include <stdint.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-/**
- * Initialize UI system
- * - Initializes display hardware
- * - Sets up LVGL
- * 
- * @return ESP_OK on success
- */
+// Initialize UI system
 esp_err_t ui_manager_init(void);
 
-/**
- * Update accelerometer display values
- * 
- * @param accel_x X-axis acceleration
- * @param accel_y Y-axis acceleration
- * @param accel_z Z-axis acceleration
- */
-void ui_update_accel(int16_t accel_x, int16_t accel_y, int16_t accel_z);
-
-/**
- * Start UI task
- * Creates FreeRTOS task for display updates
- */
+// Start UI task
 void ui_manager_start_task(void);
 
-#ifdef __cplusplus
-}
-#endif
+// Update accelerometer display values
+void ui_update_accel(int16_t accel_x, int16_t accel_y, int16_t accel_z);
+
+// Update all UI elements (call from main loop)
+void ui_update_all(void);
 
 #endif // UI_MANAGER_H

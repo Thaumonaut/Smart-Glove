@@ -7,6 +7,7 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "../display.h"
+#include "../bluetooth.h"
 #include "../sensors/sensor_manager.h"
 
 static const char *TAG = "UIManager";
@@ -23,9 +24,6 @@ static void ui_task(void *pvParameters) {
     ESP_LOGI(TAG, "UI task started");
 
     while (1) {
-        // Update accelerometer display
-        display_update_accel(display_accel_x, display_accel_y, display_accel_z);
-
         // Handle LVGL timer
         display_lvgl_tick();
 
@@ -47,6 +45,22 @@ void ui_update_accel(int16_t accel_x, int16_t accel_y, int16_t accel_z) {
     display_accel_x = accel_x;
     display_accel_y = accel_y;
     display_accel_z = accel_z;
+}
+
+void ui_update_all(void) {
+    // Update accelerometer display
+    // display_update_accel(display_accel_x, display_accel_y, display_accel_z);
+    
+    // Update Bluetooth status
+    char title[128] = {0};
+    char artist[128] = {0};
+    bool has_metadata = bluetooth_get_track_info(title, sizeof(title), artist, sizeof(artist));
+    
+    display_update_bluetooth_state(bluetooth_is_connected(),
+                                   bluetooth_is_playing_audio(),
+                                   bluetooth_is_call_active(),
+                                   has_metadata ? title : NULL,
+                                   has_metadata ? artist : NULL);
 }
 
 void ui_manager_start_task(void) {

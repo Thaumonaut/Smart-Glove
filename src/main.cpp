@@ -208,15 +208,6 @@ extern "C" void app_main(void) {
     ESP_LOGI(TAG, "");
     
     ui_manager_init();
-    
-    // Initial display update
-    char title[128] = {0};
-    char artist[128] = {0};
-    bluetooth_get_track_info(title, sizeof(title), artist, sizeof(artist));
-    display_update_bluetooth_state(bluetooth_is_connected(), 
-                                   bluetooth_is_playing_audio(),
-                                   bluetooth_is_call_active(),
-                                   title, artist);
 
     // Start all tasks
     ESP_LOGI(TAG, "Starting tasks...");
@@ -231,25 +222,17 @@ extern "C" void app_main(void) {
     // Main loop (optional - tasks run independently)
     while (1) {
         // Get sensor state for display updates
-        sensor_state_t sensors;
-        sensor_manager_get_state(&sensors);
+        // sensor_state_t sensors;
+        // sensor_manager_get_state(&sensors);
         
-        if (sensors.motion.valid) {
-            ui_update_accel(sensors.motion.accel_x, 
-                           sensors.motion.accel_y, 
-                           sensors.motion.accel_z);
-        }
+        // if (sensors.motion.valid) {
+        //     ui_update_accel(sensors.motion.accel_x, 
+        //                    sensors.motion.accel_y, 
+        //                    sensors.motion.accel_z);
+        // }
         
-        // Update Bluetooth status on display
-        char title[128] = {0};
-        char artist[128] = {0};
-        bool has_metadata = bluetooth_get_track_info(title, sizeof(title), artist, sizeof(artist));
-        
-        display_update_bluetooth_state(bluetooth_is_connected(),
-                                       bluetooth_is_playing_audio(),
-                                       bluetooth_is_call_active(),
-                                       has_metadata ? title : NULL,
-                                       has_metadata ? artist : NULL);
+        // Update all UI elements
+        ui_update_all();
         
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
