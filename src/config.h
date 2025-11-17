@@ -94,6 +94,13 @@
 #define TFT_WIDTH       135
 #define TFT_HEIGHT      240
 
+// Some ST7789 modules have hardware memory offsets between driver and visible region.
+// If you see the UI shifted up/left or thin static bands at edges, set these
+// offsets to appropriate values for your display. Typical values for 135x240
+// modules: X offset = 52, Y offset = 40.
+#define TFT_OFFSET_X    52
+#define TFT_OFFSET_Y    40
+
 // ============================================================================
 // BLUETOOTH CONFIGURATION
 // ============================================================================

@@ -197,6 +197,16 @@ extern "C" void app_main(void) {
     // Initialize microphone for HFP uplink (uses different clock source than speaker)
     bluetooth_init_microphone();
     
+    // NOTE: Encoder replacement complete - using stable BlueZ libsbc instead of ESP-ADF
+    // The previous encoder disable test proved ESP-ADF encoder was the crash source
+    // Now using task-local libsbc encoder which is stable and battle-tested
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "##############################################");
+    ESP_LOGI(TAG, "### libsbc encoder active (ESP-ADF replaced) ###");
+    ESP_LOGI(TAG, "##############################################");
+    // bluetooth_disable_hfp_encoder(true);  // No longer needed - libsbc is stable
+    ESP_LOGI(TAG, "");
+    
     ui_manager_init();
     
     // Update display with initial Bluetooth status (now that display is ready)

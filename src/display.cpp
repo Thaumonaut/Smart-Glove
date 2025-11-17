@@ -29,6 +29,9 @@ static lv_obj_t *label_message;
 
 // SPI device handle
 static spi_device_handle_t spi;
+// Global offsets (initialized from config macros)
+int g_tft_offset_x = TFT_OFFSET_X;
+int g_tft_offset_y = TFT_OFFSET_Y;
 
 // ============================================================================
 // ST7789 Commands
@@ -99,6 +102,8 @@ static void st7789_init(void) {
     vTaskDelay(pdMS_TO_TICKS(120));
 
     st7789_write_cmd(ST7789_MADCTL);
+    // Default orientation. Adjust by setting TFT_ROTATION in config if needed.
+    // 0x00 = default (RGB order). Some modules require 0x60/0xC0 to rotate display.
     st7789_write_data(0x00);  // RGB order, vertical refresh
 
     st7789_write_cmd(ST7789_COLMOD);
@@ -116,6 +121,7 @@ static void st7789_init(void) {
     gpio_set_level((gpio_num_t)TFT_BL, 1);
 
     ESP_LOGI(TAG, "ST7789 initialized");
+    ESP_LOGI(TAG, "TFT offsets: X=%d, Y=%d", TFT_OFFSET_X, TFT_OFFSET_Y);
 }
 
 // ============================================================================
@@ -123,6 +129,9 @@ static void st7789_init(void) {
 // ============================================================================
 
 static void st7789_set_addr_window(uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
+    // Apply hardware offsets for modules that require it
+    x += (uint16_t)g_tft_offset_x;
+    y += (uint16_t)g_tft_offset_y;
     uint16_t x_end = x + w - 1;
     uint16_t y_end = y + h - 1;
 
@@ -217,7 +226,8 @@ void display_init(void) {
     label_title = lv_label_create(scr);
     lv_label_set_text(label_title, "Smart Glove");
     lv_obj_set_style_text_color(label_title, lv_color_white(), 0);
-    lv_obj_align(label_title, LV_ALIGN_TOP_MID, 0, 5);
+    // Slightly lower the title to avoid clipping at the top of some modules
+    lv_obj_align(label_title, LV_ALIGN_TOP_MID, 0, 8);
 
     // Bluetooth status
     label_bt_status = lv_label_create(scr);
@@ -249,6 +259,18 @@ void display_init(void) {
     lv_obj_align(label_message, LV_ALIGN_BOTTOM_MID, 0, -10);
 
     ESP_LOGI(TAG, "Display initialized successfully");
+}
+
+// Adjust hardware offsets at runtime (helps tune mapping for specific modules)
+void display_set_offsets(int x_offset, int y_offset) {
+    // Note: Changing these values affects only future flushes; LVGL redraw is needed.
+    // We simply update the defines via a static variable in code for tuning.
+    // This function is best-effort for debugging; a more robust approach would
+    // add offsets into st7789_set_addr_window parameters.
+    ESP_LOGI(TAG, "Setting display offsets to X=%d, Y=%d (reinit not required)", x_offset, y_offset);
+    // Update the global offsets used by the driver
+    g_tft_offset_x = x_offset;
+    g_tft_offset_y = y_offset;
 }
 
 // ============================================================================

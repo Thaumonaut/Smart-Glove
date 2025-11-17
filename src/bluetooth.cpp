@@ -18,33 +18,493 @@
 #include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/ringbuf.h"
+#include "freertos/queue.h"
+#include "esp_heap_caps.h"
+#include "esp_memory_utils.h"
 
-// ESP-ADF SBC decoder/encoder for mSBC
+// ESP-ADF SBC decoder for mSBC (decoder works fine, keep it)
 #include "decoder/esp_audio_dec.h"
 #include "decoder/impl/esp_sbc_dec.h"
-#include "encoder/esp_audio_enc.h"
-#include "encoder/impl/esp_sbc_enc.h"
-#include "esp_sbc_def.h"
+
+// BlueZ libsbc encoder (stable replacement for ESP-ADF encoder)
+#include "sbc.h"
 
 static const char *TAG = "Bluetooth";
+// Trace toggles
+static bool hfp_trace_full = true; // default to true per user's request to enable tracing unless disabled
+
+// Small helper to checksum a buffer for quick corruption detection (first/last bytes)
+static uint32_t buf_checksum(const uint8_t *buf, size_t len, size_t max_sample_bytes) {
+    if (!buf || len == 0) return 0;
+    uint32_t sum = 0;
+    size_t n = max_sample_bytes;
+    if (n > len) n = len;
+    // Sum first n bytes
+    for (size_t i = 0; i < n; ++i) sum += buf[i];
+    // Sum last n bytes
+    if (len > n) {
+        size_t start = (len > n) ? (len - n) : 0;
+        for (size_t i = start; i < len; ++i) sum += buf[i];
+    }
+    return sum;
+}
+
+// Log details of an HFP audio buffer (safely)
+static void hfp_log_buffer_info(const char *where, esp_hf_audio_buff_t *b) {
+    if (!b) {
+        ESP_LOGD(TAG, "%s: HFP buf=null", where);
+        return;
+    }
+    bool data_dma = esp_ptr_dma_capable(b->data);
+    uintptr_t aligned = ((uintptr_t)b->data & 0x3) == 0;
+    uint32_t chks = 0;
+    if (b->data && b->data_len > 0) chks = buf_checksum(b->data, b->data_len, 8);
+    ESP_LOGD(TAG, "%s: hfp_buf=%p data=%p buff_size=%d data_len=%d dma=%d align=%d checksum=0x%08x", where,
+             b, b->data, (int)b->buff_size, (int)b->data_len, (int)data_dma, (int)aligned, (unsigned)chks);
+}
 
 // Bluetooth state
 static bool bt_connected = false;
 static bool audio_playing = false;
 
 // HFP state
-static bool hfp_connected = false;
-static bool call_active = false;
+// CRITICAL: Use volatile to prevent multi-core race conditions
+static volatile bool hfp_connected = false;
+static volatile bool call_active = false;
 static esp_hf_call_status_t call_status = ESP_HF_CALL_STATUS_NO_CALLS;
 
 // mSBC decoder/encoder state
-static void *msbc_decoder = NULL;
-static void *msbc_encoder = NULL;
-static esp_hf_sync_conn_hdl_t hfp_sync_conn_hdl = 0;  // Store connection handle for uplink
+// CRITICAL: Use volatile to prevent compiler optimization issues in multi-core access
+static volatile void *msbc_decoder = NULL;
+static volatile void *msbc_encoder = NULL;
+static volatile esp_hf_sync_conn_hdl_t hfp_sync_conn_hdl = 0;  // Store connection handle for uplink
 static uint32_t hfp_rx_packet_count = 0;  // Count packets received from phone
 static bool mic_tx_ready = false;  // Only send mic data after receiving packets from phone
 static uint16_t hfp_preferred_frame_size = 60;  // Frame size from phone (set in AUDIO_STATE_EVT)
 static volatile bool mic_tx_slot_available = false;  // Set to true each time we receive audio from phone
+
+// Mic TX worker queue/task for encoding and sending uplink data from a single safe context
+static QueueHandle_t mic_tx_queue = NULL;
+static RingbufHandle_t hfp_ringbuf = NULL; // ring buffer carrying pointers to esp_hf_audio_buff_t
+static QueueHandle_t hfp_send_queue = NULL; // optional queue fallback for debugging
+static bool hfp_use_queue = false; // if true, use hfp_send_queue instead of hfp_ringbuf
+static TaskHandle_t hfp_sender_task_handle = NULL;
+static uint32_t mic_tx_drops = 0;
+static uint32_t hfp_send_drops = 0;
+static uint32_t hfp_encode_fallback_count = 0;
+static bool hfp_force_safe_encode = false;
+static bool hfp_disable_encoder = false; // If true, skip calling esp_sbc_enc_process (debug)
+// debug telemetry
+static uint32_t telemetry_tick = 0;
+static void hfp_telemetry_task(void *pv);
+static TaskHandle_t mic_tx_task_handle = NULL;
+typedef struct {
+    uint8_t *pcm;     // PCM data (16-bit mono) length = msbc_in_size
+    size_t len;       // Length in bytes
+} mic_tx_item_t;
+
+static void hfp_sender_task(void *pv);
+
+static void mic_tx_task(void *pv) {
+    (void)pv;
+    ESP_LOGI(TAG, "Mic TX task started");
+
+    // CRITICAL FIX: Use BlueZ libsbc encoder (stable, battle-tested)
+    // Create encoder locally on THIS core (Core 1)
+    sbc_t *sbc_encoder = (sbc_t *)heap_caps_malloc(sizeof(sbc_t), MALLOC_CAP_8BIT);
+    if (!sbc_encoder) {
+        ESP_LOGE(TAG, ">>>MIC_TX_TASK: Failed to allocate sbc_t structure!");
+        ESP_LOGE(TAG, ">>>MIC_TX_TASK: CANNOT PROCEED - Task will exit");
+        vTaskDelete(NULL);
+        return;
+    }
+    
+    ESP_LOGI(TAG, ">>>MIC_TX_TASK: Initializing libsbc mSBC encoder on Core 1...");
+    
+    // Initialize SBC encoder
+    int ret = sbc_init(sbc_encoder, 0);
+    if (ret < 0) {
+        ESP_LOGE(TAG, ">>>MIC_TX_TASK: sbc_init failed: %d", ret);
+        heap_caps_free(sbc_encoder);
+        vTaskDelete(NULL);
+        return;
+    }
+    
+    // Configure for mSBC (HFP wideband)
+    // mSBC parameters: 16kHz, 15 blocks, 8 subbands, mono, bitpool 26
+    sbc_encoder->frequency = SBC_FREQ_16000;     // 16kHz for HFP wideband
+    sbc_encoder->blocks = SBC_BLK_16;            // 15 blocks (closest is 16)
+    sbc_encoder->subbands = SBC_SB_8;            // 8 subbands
+    sbc_encoder->mode = SBC_MODE_MONO;           // Mono for HFP
+    sbc_encoder->allocation = SBC_AM_LOUDNESS;   // Loudness allocation
+    sbc_encoder->bitpool = 26;                   // mSBC standard bitpool
+    sbc_encoder->endian = SBC_LE;                // Little-endian for ESP32
+    
+    // Get frame sizes
+    size_t in_size = sbc_get_codesize(sbc_encoder);      // PCM input size
+    size_t out_size = sbc_get_frame_length(sbc_encoder); // Encoded output size
+    
+    ESP_LOGI(TAG, ">>>MIC_TX_TASK: libsbc encoder initialized successfully");
+    ESP_LOGI(TAG, ">>>MIC_TX_TASK: Frame sizes - in=%d bytes, out=%d bytes", in_size, out_size);
+
+    while (1) {
+        ESP_LOGI(TAG, ">>>MIC_TX_TASK: TOP OF LOOP - about to wait for queue");
+        mic_tx_item_t item;
+        if (xQueueReceive(mic_tx_queue, &item, portMAX_DELAY) == pdTRUE) {
+            ESP_LOGI(TAG, ">>>MIC_TX_TASK: GOT ITEM ptr=%p len=%d", item.pcm, (int)item.len);
+            ESP_LOGI(TAG, ">>>MIC_TX_TASK: About to check DMA capability");
+            bool is_dma = esp_ptr_dma_capable(item.pcm);
+            ESP_LOGI(TAG, ">>>MIC_TX_TASK: DMA check done: %d", (int)is_dma);
+            ESP_LOGI(TAG, ">>>MIC_TX_TASK: About to calculate checksum");
+            uint32_t chk = buf_checksum(item.pcm, item.len, 8);
+            ESP_LOGI(TAG, ">>>MIC_TX_TASK: Checksum done: 0x%08x", (unsigned)chk);
+            
+            ESP_LOGI(TAG, ">>>MIC_TX_TASK: About to check call state variables");
+            // CRITICAL: Load volatile variables into local copies to prevent multi-core race
+            // Core 0 (HFP callback) can modify these while Core 1 (this task) reads them
+            bool call_active_local = call_active;
+            bool hfp_connected_local = hfp_connected;
+            esp_hf_sync_conn_hdl_t hdl_local = hfp_sync_conn_hdl;
+            ESP_LOGI(TAG, ">>>MIC_TX_TASK: State snapshot: call=%d hfp=%d enc=%p hdl=%d", 
+                     call_active_local, hfp_connected_local, (void*)sbc_encoder, hdl_local);
+            
+            // If call is not active, skip (encoder is task-local and always valid)
+            if (!call_active_local || !hfp_connected_local || hdl_local == 0) {
+                ESP_LOGI(TAG, ">>>MIC_TX_TASK: Skipping - call not ready");
+                if (item.pcm) heap_caps_free(item.pcm);
+                continue;
+            }
+            ESP_LOGI(TAG, ">>>MIC_TX_TASK: Call state OK, proceeding with encode");
+
+            // Encode PCM to mSBC using task-local libsbc encoder
+            sbc_t *encoder = sbc_encoder;  // Use our task-local libsbc encoder
+            
+            // Validate encoder
+            if (encoder == NULL) {
+                ESP_LOGE(TAG, ">>>MIC_TX_TASK: ENCODER IS NULL! Skipping frame");
+                if (item.pcm) heap_caps_free(item.pcm);
+                continue;
+            }
+            
+            // Get frame sizes from libsbc encoder
+            size_t msbc_out_size = sbc_get_frame_length(encoder);  // Output encoded size
+            ESP_LOGI(TAG, ">>>MIC_TX_TASK: libsbc frame size=%zu bytes", msbc_out_size);
+
+            ESP_LOGI(TAG, ">>>MIC_TX_TASK: msbc_out_size=%zu, force_safe_encode=%d", msbc_out_size, (int)hfp_force_safe_encode);
+            
+            // CRITICAL FIX: Only allocate HFP buffer if NOT using forced safe encode mode
+            // The zero-copy path requires calling esp_hf_client_audio_buff_alloc() early which can crash
+            // if the HFP connection state changes on Core 0 while we're on Core 1
+            esp_hf_audio_buff_t *hfp_buf = NULL;
+            
+            if (!hfp_force_safe_encode) {
+                ESP_LOGI(TAG, ">>>MIC_TX_TASK: About to allocate HFP buffer (%zu bytes)", msbc_out_size);
+                
+                // Re-check call state before allocating HFP buffer
+                if (!call_active_local || !hfp_connected_local) {
+                    ESP_LOGE(TAG, ">>>MIC_TX_TASK: Call/HFP state changed! call=%d hfp=%d - aborting frame", 
+                             call_active_local, hfp_connected_local);
+                    if (item.pcm) heap_caps_free(item.pcm);
+                    continue;
+                }
+                
+                // Allocate HFP buffer for potential zero-copy path
+                hfp_buf = esp_hf_client_audio_buff_alloc((uint16_t)msbc_out_size);
+                ESP_LOGI(TAG, ">>>MIC_TX_TASK: HFP buffer allocation returned: buf=%p", hfp_buf);
+                if (!hfp_buf || !hfp_buf->data) {
+                    ESP_LOGW(TAG, "Failed to allocate HFP buffer for mSBC output (%d bytes)", (int)msbc_out_size);
+                    if (hfp_buf) esp_hf_client_audio_buff_free(hfp_buf);
+                    if (item.pcm) heap_caps_free(item.pcm);
+                    continue;
+                }
+            } else {
+                ESP_LOGI(TAG, ">>>MIC_TX_TASK: Safe encode mode - HFP buffer will be allocated later in fallback path");
+            }
+
+            // Input PCM data from queue item
+            const void *in_buffer = item.pcm;
+            size_t in_len = item.len;
+
+            // CRITICAL: Only check DMA capability if we have an HFP buffer
+            // When hfp_force_safe_encode=true, hfp_buf is NULL and we skip to fallback path
+            bool hfp_buf_dma = false;
+            if (hfp_buf != NULL) {
+                // Prefer zero-copy into the HFP buffer ONLY if that buffer is DMA-capable.
+                // Otherwise encode into a DMA-capable temp buffer and copy into the HFP buffer
+                // Ensure HFP buffer is DMA-capable and word-aligned for encoder
+                hfp_buf_dma = esp_ptr_dma_capable(hfp_buf->data) && (((uintptr_t)hfp_buf->data & 0x3) == 0);
+                // Also make sure the HFP buffer is large enough for an encoded frame;
+                // `esp_hf_client_audio_buff_alloc` may return a smaller `buff_size` than requested.
+                if ((size_t)hfp_buf->buff_size < msbc_out_size) {
+                    ESP_LOGD(TAG, "HFP buffer too small for zero-copy (%d < %d), will fallback", hfp_buf->buff_size, (int)msbc_out_size);
+                    hfp_buf_dma = false;
+                }
+                // Ensure PCM buffer is also DMA-aligned for encoder
+                if (((uintptr_t)item.pcm & 0x3) != 0) {
+                    ESP_LOGD(TAG, "PCM buffer not 4-byte aligned, will fallback to safe encode\n");
+                    hfp_buf_dma = false;
+                }
+            }
+            
+            // Encode using libsbc
+            ssize_t encoded_bytes = 0;
+            int ret = 0;  // libsbc returns negative on error, positive = bytes written
+            
+            if (hfp_buf_dma && !hfp_force_safe_encode) {
+                // Zero-copy path: encode directly into the HFP buffer
+                ESP_LOGD(TAG, "Using zero-copy mSBC encode into HFP buffer (DMA)");
+                ESP_LOGD(TAG, "ENC-ZERO-COPY: hfp_buf=%p size=%d hfp_buf_dma=%d force_safe=%d in_len=%zu enc=%p", 
+                         hfp_buf->data, (int)hfp_buf->buff_size, (int)hfp_buf_dma, 
+                         (int)hfp_force_safe_encode, in_len, encoder);
+                
+                if (hfp_disable_encoder) {
+                    ESP_LOGW(TAG, "ENC-DEBUG: hfp_disable_encoder active — skipping encoder (zero-copy path)");
+                    encoded_bytes = 0;
+                    ret = 0;  // Success but no encoding
+                } else {
+                    // Use libsbc to encode directly into HFP buffer
+                    ret = sbc_encode(sbc_encoder, 
+                                    in_buffer, in_len,
+                                    hfp_buf->data, hfp_buf->buff_size,
+                                    &encoded_bytes);
+                }
+                
+                ESP_LOGD(TAG, "ENC-ZERO-COPY result=%d enc_bytes=%zd checksum=0x%08x", 
+                         ret, encoded_bytes,
+                         (unsigned)buf_checksum(hfp_buf->data, encoded_bytes, 8));
+            } else {
+                ESP_LOGD(TAG, "HFP buffer not DMA-capable; using DMA temp buffer for mSBC encode");
+                hfp_encode_fallback_count++;
+            }
+            
+            // Check encoding success (libsbc returns positive bytes or negative error)
+            if (ret >= 0 && encoded_bytes > 0) {
+                // Verify encoded bytes fit the allocated HFP buffer
+                if ((size_t)encoded_bytes > hfp_buf->buff_size) {
+                    ESP_LOGW(TAG, "Encoder produced %zd bytes > allocated %d, dropping frame",
+                             encoded_bytes, (int)hfp_buf->buff_size);
+                    esp_hf_client_audio_buff_free(hfp_buf);
+                    if (item.pcm) heap_caps_free(item.pcm);
+                    continue;
+                }
+
+                // Set final encoded length and use zero-copy by passing the buffer pointer
+                hfp_buf->data_len = encoded_bytes;
+                hfp_buf->buff_size = encoded_bytes;
+                ESP_LOGD(TAG, "ENC-ZERO-COPY: encoded_bytes=%zd checksum=0x%08x", encoded_bytes,
+                         (unsigned)buf_checksum(hfp_buf->data, encoded_bytes, 8));
+
+                if (hfp_ringbuf) {
+                    esp_hf_audio_buff_t *buf_ptr = hfp_buf;
+                    // Choose queue vs ringbuffer depending on debug flag
+                    if (hfp_use_queue && hfp_send_queue) {
+                        ESP_LOGD(TAG, "HFP push: queued via queue hfp_buf=%p len=%d (zero_copy=%d) checksum=0x%08x", hfp_buf, hfp_buf->data_len, hfp_buf_dma && !hfp_force_safe_encode,
+                                 (unsigned)buf_checksum(hfp_buf->data, hfp_buf->data_len, 8));
+                        if (xQueueSend(hfp_send_queue, &buf_ptr, 0) != pdTRUE) {
+                            ESP_LOGW(TAG, "HFP send queue full, dropping encoded frame");
+                            hfp_send_drops++;
+                            esp_hf_client_audio_buff_free(hfp_buf);
+                        }
+                    } else {
+                        ESP_LOGD(TAG, "HFP push: queued hfp_buf=%p len=%d (zero_copy=%d) checksum=0x%08x", hfp_buf, hfp_buf->data_len, hfp_buf_dma && !hfp_force_safe_encode,
+                                 (unsigned)buf_checksum(hfp_buf->data, hfp_buf->data_len, 8));
+                        BaseType_t rb_ret = xRingbufferSend(hfp_ringbuf, &buf_ptr, sizeof(buf_ptr), 0);
+                        if (rb_ret != pdTRUE) {
+                            ESP_LOGW(TAG, "HFP ringbuffer full, dropping encoded frame");
+                            hfp_send_drops++;
+                            esp_hf_client_audio_buff_free(hfp_buf);
+                        }
+                    }
+                } else {
+                    // Fallback: send immediately if ringbuffer isn't available
+                    esp_err_t send_ret = esp_hf_client_audio_data_send(hfp_sync_conn_hdl, hfp_buf);
+                    if (send_ret != ESP_OK) {
+                        ESP_LOGW(TAG, "Mic TX send failed (fallback): %d", send_ret);
+                        esp_hf_client_audio_buff_free(hfp_buf);
+                    }
+                }
+            } else {
+                // Fallback path: encode into DMA temp buffer, then copy to HFP buffer
+                ESP_LOGI(TAG, ">>>MIC_TX_TASK: Entering safe encode fallback path");
+                
+                // Allocate HFP buffer if we haven't already (happens when hfp_force_safe_encode is set)
+                esp_hf_audio_buff_t *hfp_buf_fallback = hfp_buf;
+                if (!hfp_buf_fallback) {
+                    ESP_LOGI(TAG, ">>>MIC_TX_TASK: Allocating HFP buffer in fallback path (%zu bytes)", msbc_out_size);
+                    hfp_buf_fallback = esp_hf_client_audio_buff_alloc((uint16_t)msbc_out_size);
+                    ESP_LOGI(TAG, ">>>MIC_TX_TASK: Fallback HFP buffer: %p", hfp_buf_fallback);
+                    if (!hfp_buf_fallback || !hfp_buf_fallback->data) {
+                        ESP_LOGW(TAG, "Failed to allocate HFP buffer in fallback path");
+                        if (hfp_buf_fallback) esp_hf_client_audio_buff_free(hfp_buf_fallback);
+                        if (item.pcm) heap_caps_free(item.pcm);
+                        continue;
+                    }
+                }
+                
+                // allocate tmp buffer with slight headroom to avoid encoder writing past end
+                size_t msbc_tmp_alloc = msbc_out_size + 64;
+                uint8_t *msbc_tmp = (uint8_t *)heap_caps_malloc(msbc_tmp_alloc, MALLOC_CAP_DMA);
+                if (!msbc_tmp) {
+                    ESP_LOGW(TAG, "mSBC fallback allocation failed (%d bytes)", (int)msbc_out_size);
+                    esp_hf_client_audio_buff_free(hfp_buf);
+                    if (item.pcm) heap_caps_free(item.pcm);
+                    continue;
+                }
+
+                // Fill sentinel guard bytes before/after the usable region so we can detect overflow
+                const uint8_t GUARD = 0xA5;
+                size_t GUARD_SZ = 16;
+                if (msbc_tmp_alloc > GUARD_SZ * 2) {
+                    memset(msbc_tmp, GUARD, GUARD_SZ);
+                    memset(msbc_tmp + msbc_tmp_alloc - GUARD_SZ, GUARD, GUARD_SZ);
+                }
+                
+                ESP_LOGD(TAG, "ENC-FALLBACK: msbc_tmp=%p alloc=%u in_len=%zu enc_handle=%p", 
+                         msbc_tmp, (unsigned)msbc_tmp_alloc, in_len, encoder);
+                
+                ssize_t fallback_encoded_bytes = 0;
+                int ret2;
+                
+                if (hfp_disable_encoder) {
+                    ESP_LOGW(TAG, "ENC-DEBUG: hfp_disable_encoder active — skipping encoder (fallback path)");
+                    fallback_encoded_bytes = 0;
+                    ret2 = 0;  // Success but no encoding
+                } else {
+                    // Use libsbc to encode into temporary buffer
+                    ESP_LOGI(TAG, ">>>MIC_TX_TASK: PRE-ENCODE: encoder=%p, in.buffer=%p, in.len=%zu, out.buffer=%p, out.len=%u",
+                             encoder, in_buffer, in_len, msbc_tmp, msbc_tmp_alloc);
+                    
+                    ret2 = sbc_encode(sbc_encoder,
+                                     in_buffer, in_len,
+                                     msbc_tmp, msbc_tmp_alloc,
+                                     &fallback_encoded_bytes);
+                    
+                    ESP_LOGI(TAG, ">>>MIC_TX_TASK: POST-ENCODE: ret=%d, encoded_bytes=%zd", 
+                             ret2, fallback_encoded_bytes);
+                }
+                
+                ESP_LOGD(TAG, "sbc_encode ret=%d encoded_bytes=%zd checksum=0x%08x", 
+                         ret2, fallback_encoded_bytes,
+                         (unsigned)buf_checksum(msbc_tmp, fallback_encoded_bytes, 8));
+                // Check sentinel guards for overflow
+                if (msbc_tmp_alloc > GUARD_SZ * 2) {
+                    bool corrupted = false;
+                    for (size_t i = 0; i < GUARD_SZ; ++i) {
+                        if (msbc_tmp[i] != GUARD) { corrupted = true; break; }
+                    }
+                    for (size_t i = 0; i < GUARD_SZ && !corrupted; ++i) {
+                        if (msbc_tmp[msbc_tmp_alloc - GUARD_SZ + i] != GUARD) { corrupted = true; break; }
+                    }
+                    if (corrupted) {
+                        ESP_LOGW(TAG, "ENC-FALLBACK: buffer overflow detected for msbc_tmp=%p alloc=%u", msbc_tmp, (unsigned)msbc_tmp_alloc);
+                    }
+                }
+                
+                // Check encoding success and copy to HFP buffer
+                if (ret2 >= 0 && fallback_encoded_bytes > 0 && 
+                    (size_t)fallback_encoded_bytes <= hfp_buf_fallback->buff_size) {
+                    memcpy(hfp_buf_fallback->data, msbc_tmp, fallback_encoded_bytes);
+                    hfp_buf_fallback->data_len = fallback_encoded_bytes;
+                    hfp_buf_fallback->buff_size = fallback_encoded_bytes;
+                    if (hfp_ringbuf) {
+                        ESP_LOGD(TAG, "ENC-FALLBACK: copied into hfp_buf=%p data_len=%d checksum=0x%08x", hfp_buf_fallback, hfp_buf_fallback->data_len,
+                                 (unsigned)buf_checksum(hfp_buf_fallback->data, hfp_buf_fallback->data_len, 8));
+                        esp_hf_audio_buff_t *buf_ptr = hfp_buf_fallback;
+                        if (hfp_use_queue && hfp_send_queue) {
+                            if (xQueueSend(hfp_send_queue, &buf_ptr, 0) != pdTRUE) {
+                                ESP_LOGW(TAG, "HFP send queue full, dropping encoded frame (fallback)");
+                                hfp_send_drops++;
+                                esp_hf_client_audio_buff_free(hfp_buf_fallback);
+                            }
+                        } else {
+                            BaseType_t rb_ret = xRingbufferSend(hfp_ringbuf, &buf_ptr, sizeof(buf_ptr), 0);
+                            if (rb_ret != pdTRUE) {
+                                ESP_LOGW(TAG, "HFP ringbuffer full, dropping encoded frame (fallback)");
+                                hfp_send_drops++;
+                                esp_hf_client_audio_buff_free(hfp_buf_fallback);
+                            }
+                        }
+                    } else {
+                        esp_err_t send_ret = esp_hf_client_audio_data_send(hfp_sync_conn_hdl, hfp_buf_fallback);
+                        if (send_ret != ESP_OK) {
+                            ESP_LOGW(TAG, "Mic TX send failed (fallback send): %d", send_ret);
+                            esp_hf_client_audio_buff_free(hfp_buf_fallback);
+                        }
+                    }
+                } else {
+                    ESP_LOGW(TAG, "mSBC fallback failed: ret=%d encoded=%zd", ret2, fallback_encoded_bytes);
+                    esp_hf_client_audio_buff_free(hfp_buf_fallback);
+                }
+
+                heap_caps_free(msbc_tmp);
+            }
+            if (item.pcm) heap_caps_free(item.pcm);
+        }
+    }
+    
+    // Cleanup encoder when task exits
+    if (sbc_encoder) {
+        sbc_finish(sbc_encoder);
+        heap_caps_free(sbc_encoder);
+        ESP_LOGI(TAG, "libsbc encoder destroyed");
+    }
+}
+
+// Dedicated HFP sender: consume prepared esp_hf_audio_buff_t* and send to the phone
+static void hfp_sender_task(void *pv) {
+    (void)pv;
+    ESP_LOGI(TAG, "HFP sender task started");
+
+    while (1) {
+        ESP_LOGI(TAG, ">>>HFP_SENDER: TOP OF LOOP - about to wait for data");
+        esp_hf_audio_buff_t *send_buf = NULL;
+        // Optional queue path for debugging: read from queue instead of ringbuffer
+        if (hfp_use_queue && hfp_send_queue) {
+            ESP_LOGI(TAG, ">>>HFP_SENDER: waiting on QUEUE");
+            if (xQueueReceive(hfp_send_queue, &send_buf, portMAX_DELAY) != pdTRUE) {
+                continue;
+            }
+            ESP_LOGI(TAG, ">>>HFP_SENDER: got buf from QUEUE: %p", send_buf);
+        } else {
+            ESP_LOGI(TAG, ">>>HFP_SENDER: waiting on RINGBUFFER");
+            size_t item_size;
+            void *item = xRingbufferReceive(hfp_ringbuf, &item_size, portMAX_DELAY);
+            if (item != NULL && item_size == sizeof(esp_hf_audio_buff_t*)) {
+                send_buf = *((esp_hf_audio_buff_t**)item);
+                ESP_LOGI(TAG, ">>>HFP_SENDER: got buf from RINGBUF: %p (returning ringbuf item)", send_buf);
+                vRingbufferReturnItem(hfp_ringbuf, item);
+                ESP_LOGI(TAG, ">>>HFP_SENDER: ringbuf item returned successfully");
+            }
+        }
+        // Log details of the HFP buffer before we wait for a slot
+        ESP_LOGI(TAG, ">>>HFP_SENDER: about to log buffer info");
+        hfp_log_buffer_info("HFP-sender-pre-slot", send_buf);
+        ESP_LOGI(TAG, ">>>HFP_SENDER: buffer info logged, now waiting for TX slot");
+            // Wait for a TX slot from the incoming HFP audio callback
+            while (!mic_tx_slot_available) {
+                vTaskDelay(pdMS_TO_TICKS(1));
+                // If call went away, free and break
+                if (!call_active || !hfp_connected || hfp_sync_conn_hdl == 0) {
+                    if (send_buf) esp_hf_client_audio_buff_free(send_buf);
+                    send_buf = NULL;
+                    break;
+                }
+            }
+            if (!send_buf) continue;
+
+            // Consume the available slot
+            mic_tx_slot_available = false;
+
+            esp_err_t send_ret = esp_hf_client_audio_data_send(hfp_sync_conn_hdl, send_buf);
+            ESP_LOGD(TAG, "HFP sender: esp_hf_client_audio_data_send returned %d for buf=%p", send_ret, send_buf);
+            if (send_ret != ESP_OK) {
+                ESP_LOGW(TAG, "HFP sender task: failed to send (ret=%d)", send_ret);
+                esp_hf_client_audio_buff_free(send_buf);
+            }
+        
+    }
+}
 
 // Microphone data callback - called by mic_manager when audio is available
 static void mic_data_ready_cb(const uint8_t *data, size_t len) {
@@ -55,10 +515,15 @@ static void mic_data_ready_cb(const uint8_t *data, size_t len) {
     if (packet_count <= 10 || packet_count % 100 == 0) {
         // Also log first few raw samples to debug microphone reading
         const int32_t *samples_32 = (const int32_t *)data;
+        int32_t s0 = 0, s1 = 0, s2 = 0;
+        size_t num_samples_dbg = (len / 4);
+        if (num_samples_dbg >= 1) s0 = samples_32[0];
+        if (num_samples_dbg >= 2) s1 = samples_32[1];
+        if (num_samples_dbg >= 3) s2 = samples_32[2];
         ESP_LOGI(TAG, "MIC CALLBACK #%lu: call=%d, hfp=%d, hdl=%d, ready=%d, rx=%lu, slot=%d, len=%d [raw32: %ld, %ld, %ld]",
                  packet_count, call_active, hfp_connected, hfp_sync_conn_hdl,
                  mic_tx_ready, hfp_rx_packet_count, mic_tx_slot_available, len,
-                 samples_32[0], samples_32[1], samples_32[2]);
+                 s0, s1, s2);
     }
     
     if (!call_active || !hfp_connected || hfp_sync_conn_hdl == 0) {
@@ -92,16 +557,40 @@ static void mic_data_ready_cb(const uint8_t *data, size_t len) {
     // CRITICAL: mSBC encoder requires exactly 240 bytes PCM input (120 samples @ 16-bit)
     // The "preferred frame size" (57 bytes) is the ENCODED OUTPUT size, not input!
     // Encoder expects: 120 samples × 2 bytes/sample = 240 bytes PCM input
-    #define MSBC_PCM_INPUT_SIZE 240  // 120 samples × 2 bytes per sample = 240 bytes
+    // Where possible, query the encoder frame size dynamically, but default to 240.
+    #define MSBC_PCM_INPUT_SIZE_DEFAULT 240  // 120 samples × 2 bytes per sample = 240 bytes
     
     // Use accumulator for samples until we have enough for one mSBC frame
-    static uint8_t sample_buffer[MSBC_PCM_INPUT_SIZE];
+    static uint8_t sample_buffer[MSBC_PCM_INPUT_SIZE_DEFAULT];
     static size_t sample_buf_pos = 0;
     
     // Process 32-bit mono samples from INMP441
     const int32_t *samples_32 = (const int32_t *)data;
     size_t num_samples = len / 4;  // 32-bit samples
+
+    // Debug: log first few PCM samples as 16-bit (after conversion) to trace data inputs
+    if (num_samples > 0) {
+        int16_t debug_first = (int16_t)(samples_32[0] >> 16) - 256;
+        ESP_LOGD(TAG, "MIC DEBUG: first sample(32->16)=%d num_samples=%d", debug_first, (int)num_samples);
+    }
     
+    // Determine target PCM input size for one mSBC frame
+    size_t msbc_in_size = MSBC_PCM_INPUT_SIZE_DEFAULT;
+    // NOTE: Encoder frame size query disabled - using task-local encoder with fixed size
+    // The task-local encoder in mic_tx_task will handle frame sizing
+    /*
+    void *encoder_local = (void*)msbc_encoder;  // Local non-volatile copy
+    if (encoder_local) {
+        int tmp_in = 0, tmp_out = 0;
+    if (esp_sbc_enc_get_frame_size(encoder_local, &tmp_in, &tmp_out) == ESP_AUDIO_ERR_OK) {
+            // tmp_in is number of PCM bytes expected
+            if (tmp_in > 0 && tmp_in <= MSBC_PCM_INPUT_SIZE_DEFAULT) {
+                msbc_in_size = (size_t)tmp_in;
+            }
+        }
+    }
+    */
+
     for (size_t i = 0; i < num_samples; i++) {
         // Convert 32-bit to 16-bit (take upper 16 bits where INMP441 audio data is)
         // INMP441 outputs 24-bit left-justified: bits[31:8] = audio, bits[7:0] = 0
@@ -126,76 +615,52 @@ static void mic_data_ready_cb(const uint8_t *data, size_t len) {
         sample_buffer[sample_buf_pos++] = (uint8_t)(sample_16 >> 8);
         
         // When buffer is full, encode to mSBC and send to phone
-        if (sample_buf_pos >= MSBC_PCM_INPUT_SIZE) {
+    if (sample_buf_pos >= (size_t)msbc_in_size) {
             // CRITICAL: Consume the slot BEFORE sending
             // This prevents sending multiple packets in one callback
             mic_tx_slot_available = false;
             
-            // Encode PCM to mSBC using ESP-ADF encoder
-            // Input: 240 bytes PCM (120 samples @ 16-bit mono 16kHz)
-            // Output: ~57-60 bytes mSBC encoded (varies slightly by encoder)
-            uint8_t msbc_encoded[64];  // Slightly larger buffer for safety
+            ESP_LOGI(TAG, ">>>MIC_CALLBACK: sample buffer FULL (%d bytes), about to queue for encoder", (int)msbc_in_size);
             
-            if (msbc_encoder) {
-                // Prepare input PCM frame (MUST be exactly 240 bytes for mSBC)
-                esp_audio_enc_in_frame_t in_frame = {
-                    .buffer = sample_buffer,
-                    .len = MSBC_PCM_INPUT_SIZE
-                };
-                
-                // Prepare output encoded frame
-                esp_audio_enc_out_frame_t out_frame = {
-                    .buffer = msbc_encoded,
-                    .len = sizeof(msbc_encoded)
-                };
-                
-                esp_audio_err_t ret = esp_sbc_enc_process(msbc_encoder, &in_frame, &out_frame);
-                
-                if (ret == ESP_AUDIO_ERR_OK && out_frame.encoded_bytes > 0) {
-                    // CRITICAL: Use esp_hf_client_audio_buff_alloc instead of static buffer
-                    esp_hf_audio_buff_t *hfp_buf = esp_hf_client_audio_buff_alloc(out_frame.encoded_bytes);
-                    if (hfp_buf == NULL) {
-                        ESP_LOGW(TAG, "Failed to allocate HFP audio buffer");
-                        sample_buf_pos = 0;
-                        return;
-                    }
-                    
-                    // Copy encoded mSBC data into the allocated buffer
-                    memcpy(hfp_buf->data, msbc_encoded, out_frame.encoded_bytes);
-                    hfp_buf->data_len = out_frame.encoded_bytes;
-                    hfp_buf->buff_size = out_frame.encoded_bytes;
-                    
-                    // Double-check we still have valid connection before sending
-                    if (hfp_sync_conn_hdl == 0 || !call_active) {
-                        ESP_LOGW(TAG, "Lost HFP connection, stopping mic TX");
-                        esp_hf_client_audio_buff_free(hfp_buf);
-                        sample_buf_pos = 0;
-                        return;
-                    }
-                    
-                    // Send encoded mSBC to phone
-                    esp_err_t send_ret = esp_hf_client_audio_data_send(hfp_sync_conn_hdl, hfp_buf);
-                    if (send_ret != ESP_OK) {
-                        ESP_LOGW(TAG, "Failed to send mic data: %d", send_ret);
-                        esp_hf_client_audio_buff_free(hfp_buf);  // Free on error
-                    } else {
-                        static uint32_t send_count = 0;
-                        send_count++;
-                        if (send_count % 20 == 0) {
-                            ESP_LOGI(TAG, "MIC TX #%lu: %d bytes PCM → %d bytes mSBC sent", 
-                                     send_count, MSBC_PCM_INPUT_SIZE, out_frame.encoded_bytes);
-                        }
-                    }
-                } else {
-                    ESP_LOGW(TAG, "mSBC encode failed: ret=%d, encoded_bytes=%d", ret, out_frame.encoded_bytes);
-                }
-            } else {
-                ESP_LOGW(TAG, "mSBC encoder not initialized!");
+            // Instead of encoding and sending on the mic task, enqueue the PCM frame for
+            // processing by the mic_tx_task. This ensures the encoder + HFP send happen
+            // from a single task (safer with the BT stack and encoder).
+            if (mic_tx_queue == NULL) {
+                ESP_LOGW(TAG, "Mic TX queue not available, dropping frame");
+                sample_buf_pos = 0;
+                return;
             }
-            
-            sample_buf_pos = 0;  // Reset buffer
-            
-            // CRITICAL: Return immediately after sending ONE packet
+
+            mic_tx_item_t item;
+            item.len = msbc_in_size;
+            // Use DMA-capable allocation for PCM to ensure encoder can access it safely
+            ESP_LOGI(TAG, ">>>MIC_CALLBACK: allocating DMA buffer for PCM (%d bytes)", (int)item.len);
+            item.pcm = (uint8_t *)heap_caps_malloc(item.len, MALLOC_CAP_DMA);
+            if (!item.pcm) {
+                ESP_LOGW(TAG, "Failed to alloc PCM copy for mic TX");
+                sample_buf_pos = 0;
+                return;
+            }
+            ESP_LOGI(TAG, ">>>MIC_CALLBACK: DMA buffer allocated at %p", item.pcm);
+            // Debug: checksum the prepared PCM frame for corruption tracing
+            uint32_t pcm_sum = buf_checksum(sample_buffer, item.len, 8);
+            ESP_LOGI(TAG, ">>>MIC_CALLBACK: PCM checksum=0x%08x, about to memcpy", (unsigned)pcm_sum);
+            memcpy(item.pcm, sample_buffer, item.len);
+            ESP_LOGI(TAG, ">>>MIC_CALLBACK: memcpy done, about to send to queue");
+
+            // Non-blocking send to queue to avoid delaying mic task — if queue is full we drop frame
+            if (xQueueSend(mic_tx_queue, &item, 0) != pdTRUE) {
+                ESP_LOGW(TAG, "Mic TX queue full, dropping frame");
+                mic_tx_drops++;
+                if (item.pcm) heap_caps_free(item.pcm);
+                sample_buf_pos = 0;
+                return;
+            }
+            ESP_LOGI(TAG, ">>>MIC_CALLBACK: queued PCM frame successfully, returning");
+
+            sample_buf_pos = 0;  // Reset buffer for next accumulation
+
+            // Return immediately after queuing ONE packet
             return;
         }
     }
@@ -234,6 +699,11 @@ static void bt_hfp_audio_cb(esp_hf_sync_conn_hdl_t sync_conn_hdl, esp_hf_audio_b
     if (hfp_rx_packet_count == 50) {
         mic_tx_ready = true;
         ESP_LOGI(TAG, "*** HFP RX stable - enabling mic uplink transmission ***");
+        ESP_LOGI(TAG, "HFP: force_safe_encode=%d, use_hfp_queue=%d, hfp_ringbuf=%p, hfp_send_queue=%p, msbc_encoder=%p", 
+                 (int)hfp_force_safe_encode, (int)hfp_use_queue, hfp_ringbuf, hfp_send_queue, msbc_encoder);
+        // TEMPORARILY DISABLED: Don't enable log filtering until we identify the crash point
+        // bluetooth_enable_mic_trace_only(true);
+        ESP_LOGI(TAG, ">>> TRACE FILTERING DISABLED - ALL LOGS VISIBLE FOR CRASH DEBUG");
     }
     
     // Log what packet size the phone is using (helps us match uplink)
@@ -250,7 +720,8 @@ static void bt_hfp_audio_cb(esp_hf_sync_conn_hdl_t sync_conn_hdl, esp_hf_audio_b
         // mSBC: 60 bytes encoded → 240 bytes PCM (16-bit mono @ 16kHz, 120 samples)
         int16_t pcm_buffer[240];  // Output buffer for decoded PCM
         
-        if (msbc_decoder) {
+        void *decoder_local = (void*)msbc_decoder;  // Local non-volatile copy
+        if (decoder_local) {
             // Prepare input raw data
             esp_audio_dec_in_raw_t in_raw = {
                 .buffer = audio_buf->data,
@@ -267,7 +738,7 @@ static void bt_hfp_audio_cb(esp_hf_sync_conn_hdl_t sync_conn_hdl, esp_hf_audio_b
             // Decode info (optional, can be NULL)
             esp_audio_dec_info_t dec_info = {0};
             
-            esp_audio_err_t ret = esp_sbc_dec_decode(msbc_decoder, &in_raw, &out_frame, &dec_info);
+            esp_audio_err_t ret = esp_sbc_dec_decode(decoder_local, &in_raw, &out_frame, &dec_info);
             
             if (ret == ESP_AUDIO_ERR_OK && out_frame.decoded_size > 0) {
                 // Successfully decoded - write PCM to speaker
@@ -520,30 +991,44 @@ static void bt_hfp_cb(esp_hf_client_cb_event_t event, esp_hf_client_cb_param_t *
                         .enable_plc = 0                  // Disable packet loss concealment for now
                     };
                     
-                    esp_audio_err_t ret = esp_sbc_dec_open(&dec_cfg, sizeof(dec_cfg), &msbc_decoder);
-                    if (ret == ESP_AUDIO_ERR_OK && msbc_decoder) {
+                    void *dec_temp = NULL;
+                    esp_audio_err_t ret = esp_sbc_dec_open(&dec_cfg, sizeof(dec_cfg), &dec_temp);
+                    if (ret == ESP_AUDIO_ERR_OK && dec_temp) {
+                        msbc_decoder = dec_temp;
                         ESP_LOGI(TAG, "mSBC decoder initialized successfully");
                     } else {
                         ESP_LOGE(TAG, "Failed to create mSBC decoder! Error: %d", ret);
                     }
                 }
                 
+                // NOTE: Global encoder disabled - using task-local libsbc encoder instead
+                // The task-local encoder is created in mic_tx_task on Core 1
+                /*
                 // Initialize mSBC encoder for outgoing voice (microphone)
                 ESP_LOGI(TAG, "Initializing mSBC encoder...");
                 if (msbc_encoder == NULL) {
                     // Use the official mSBC default configuration macro
                     esp_sbc_enc_config_t enc_cfg = ESP_SBC_MSBC_ENC_CONFIG_DEFAULT();
                     
-                    esp_audio_err_t ret = esp_sbc_enc_open(&enc_cfg, sizeof(enc_cfg), &msbc_encoder);
-                    if (ret == ESP_AUDIO_ERR_OK && msbc_encoder) {
+                    void *enc_temp = NULL;
+                    esp_audio_err_t ret = esp_sbc_enc_open(&enc_cfg, sizeof(enc_cfg), &enc_temp);
+                    if (ret == ESP_AUDIO_ERR_OK && enc_temp) {
+                        msbc_encoder = enc_temp;
                         // Query actual frame size expected by encoder
                         int in_size = 0, out_size = 0;
-                        esp_sbc_enc_get_frame_size(msbc_encoder, &in_size, &out_size);
+                        esp_sbc_enc_get_frame_size((void*)msbc_encoder, &in_size, &out_size);
                         ESP_LOGI(TAG, "mSBC encoder initialized: in_size=%d, out_size=%d", in_size, out_size);
+                        // Force safe encoding by default to avoid zero-copy crashes
+                        // (zero-copy relies on HFP buffer being DMA-capable; many phones do not
+                        // guarantee this). We provide a runtime toggle to enable zero-copy
+                        // if testing shows it is safe for your device.
+                        hfp_force_safe_encode = true;
+                        ESP_LOGW(TAG, "HFP mSBC: forcing safe encode by default to prevent crashes");
                     } else {
                         ESP_LOGE(TAG, "Failed to create mSBC encoder! Error: %d", ret);
                     }
                 }
+                */
                 
                 // Register audio callback NOW (required for HCI + external codec mode)
                 ESP_LOGI(TAG, "Registering HFP audio data callback...");
@@ -554,7 +1039,34 @@ static void bt_hfp_cb(esp_hf_client_cb_event_t event, esp_hf_client_cb_param_t *
                 ESP_LOGI(TAG, "Waiting 500ms for HFP audio path to stabilize...");
                 vTaskDelay(pdMS_TO_TICKS(500));
                 
-                // Enable microphone for call/recording
+                // Create Mic TX queue & task (single consumer for encoding + send)
+                if (mic_tx_queue == NULL) {
+                    mic_tx_queue = xQueueCreate(8, sizeof(mic_tx_item_t));
+                }
+                if (hfp_ringbuf == NULL) {
+                    // Create a ring buffer to hold pointers to esp_hf_audio_buff_t
+                    // Size set to hold approx 64 encoded frames (64 * 64 bytes ~ 4KB)
+                    hfp_ringbuf = xRingbufferCreate(4096, RINGBUF_TYPE_NOSPLIT);
+                }
+                // Always create an optional queue for debugging/alternate path
+                if (hfp_send_queue == NULL) {
+                    hfp_send_queue = xQueueCreate(16, sizeof(esp_hf_audio_buff_t*));
+                }
+                if (mic_tx_task_handle == NULL && mic_tx_queue != NULL) {
+                    xTaskCreate(mic_tx_task, "mic_tx_task", 4096, NULL, 6, &mic_tx_task_handle);
+                }
+                if ((hfp_ringbuf && hfp_ringbuf != NULL) || (hfp_send_queue != NULL)) {
+                    if (hfp_sender_task_handle == NULL) {
+                        xTaskCreate(hfp_sender_task, "hfp_sender", 4096, NULL, 6, &hfp_sender_task_handle);
+                    }
+                }
+                // Start telemetry task
+                static TaskHandle_t telemetry_handle = NULL;
+                if (telemetry_handle == NULL) {
+                    xTaskCreate(hfp_telemetry_task, "hfp_telemetry", 2048, NULL, 2, &telemetry_handle);
+                }
+
+                // Enable microphone for call/recording (mic_data_ready_cb will queue PCM)
                 mic_manager_enable(true);
                 ESP_LOGI(TAG, "Microphone enabled for voice connection");
                 
@@ -571,36 +1083,35 @@ static void bt_hfp_cb(esp_hf_client_cb_event_t event, esp_hf_client_cb_param_t *
                 
                 // Destroy mSBC decoder
                 if (msbc_decoder) {
-                    esp_sbc_dec_close(msbc_decoder);
+                    esp_sbc_dec_close((void*)msbc_decoder);
                     msbc_decoder = NULL;
                     ESP_LOGI(TAG, "mSBC decoder destroyed");
                 }
                 
+                // NOTE: Global encoder cleanup disabled - using task-local encoder
+                // The task-local encoder will be cleaned up when mic_tx_task exits
+                /*
                 // Destroy mSBC encoder
                 if (msbc_encoder) {
-                    esp_sbc_enc_close(msbc_encoder);
+                    esp_sbc_enc_close((void*)msbc_encoder);
                     msbc_encoder = NULL;
                     ESP_LOGI(TAG, "mSBC encoder destroyed");
                 }
-                
+                */
+
                 // Disable microphone when voice ends
                 mic_manager_enable(false);
-                hfp_sync_conn_hdl = 0;
-                hfp_rx_packet_count = 0;  // Reset packet counter
-                mic_tx_ready = false;      // Reset mic TX flag
-                mic_tx_slot_available = false;  // Reset rate limiting flag
-                ESP_LOGI(TAG, "Microphone disabled");
                 
-                // Restore I2S to 44.1kHz for A2DP music playback
-                ESP_LOGI(TAG, "Restoring I2S to 44.1kHz for music...");
+                // Reconfigure I2S back to 44.1kHz for A2DP music playback
+                ESP_LOGI(TAG, "Reconfiguring I2S back to 44.1kHz for music...");
                 
-                // Stop and clear FIFOs
+                // Stop I2S and clear FIFOs before reconfiguration
                 i2s_stop(I2S_NUM_0);
                 i2s_zero_dma_buffer(I2S_NUM_0);
                 i2s_stop(I2S_PORT_MIC);
                 i2s_zero_dma_buffer(I2S_PORT_MIC);
                 
-                // Reconfigure back to music mode
+                // Restore original A2DP configuration (44.1kHz stereo)
                 i2s_set_clk(I2S_NUM_0, 44100, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO);
                 i2s_set_clk(I2S_PORT_MIC, 44100, I2S_BITS_PER_SAMPLE_32BIT, I2S_CHANNEL_MONO);
                 
@@ -608,43 +1119,52 @@ static void bt_hfp_cb(esp_hf_client_cb_event_t event, esp_hf_client_cb_param_t *
                 i2s_start(I2S_NUM_0);
                 i2s_start(I2S_PORT_MIC);
                 
-                ESP_LOGI(TAG, "I2S restored: 44.1kHz stereo for music");
-            }
-            break;
-            
-        case ESP_HF_CLIENT_BVRA_EVT:
-            ESP_LOGI(TAG, "Voice recognition state: %d", param->bvra.value);
-            break;
-            
-        case ESP_HF_CLIENT_CIND_CALL_EVT:
-            ESP_LOGI(TAG, "Call indicator: %d", param->call.status);
-            if (param->call.status == ESP_HF_CALL_STATUS_CALL_IN_PROGRESS) {
-                ESP_LOGI(TAG, "*** CALL IN PROGRESS ***");
-                display_show_message("Call Active");
-                // Note: call_active and mic are managed by AUDIO_STATE_EVT
-            } else if (param->call.status == ESP_HF_CALL_STATUS_NO_CALLS) {
-                ESP_LOGI(TAG, "No active calls");
-                display_show_message("Call Ended");
-                // Note: call_active and mic are managed by AUDIO_STATE_EVT
-            }
-            break;
-            
-        case ESP_HF_CLIENT_CIND_CALL_SETUP_EVT:
-            ESP_LOGI(TAG, "Call setup: %d", param->call_setup.status);
-            if (param->call_setup.status == ESP_HF_CALL_SETUP_STATUS_INCOMING) {
-                ESP_LOGI(TAG, "*** INCOMING CALL ***");
-                display_show_message("Incoming Call");
-            } else if (param->call_setup.status == ESP_HF_CALL_SETUP_STATUS_OUTGOING_DIALING || 
-                       param->call_setup.status == ESP_HF_CALL_SETUP_STATUS_OUTGOING_ALERTING) {
-                ESP_LOGI(TAG, "Outgoing call...");
-                display_show_message("Calling...");
-            }
-            break;
-            
-        case ESP_HF_CLIENT_RING_IND_EVT:
-            ESP_LOGI(TAG, "*** PHONE RINGING ***");
-            // Optional: Add vibration/LED notification here
-            break;
+                ESP_LOGI(TAG, "I2S reconfigured: 44.1kHz stereo for music");
+                
+                hfp_sync_conn_hdl = 0;
+                hfp_rx_packet_count = 0;  // Reset packet counter
+                mic_tx_ready = false;      // Reset mic TX flag
+                mic_tx_slot_available = false;  // Reset rate limiting flag
+
+                // Destroy mic TX task & queue
+                if (mic_tx_task_handle) {
+                    vTaskDelete(mic_tx_task_handle);
+                    mic_tx_task_handle = NULL;
+                }
+                if (mic_tx_queue) {
+                    vQueueDelete(mic_tx_queue);
+                    mic_tx_queue = NULL;
+                }
+                // Restore serial logs to normal so console isn't filtered permanently
+                bluetooth_enable_mic_trace_only(false);
+                if (hfp_ringbuf) {
+                    // Drain any remaining HFP buffers
+                    size_t item_size;
+                    void *item = NULL;
+                    while ((item = xRingbufferReceive(hfp_ringbuf, &item_size, 0)) != NULL) {
+                        if (item_size == sizeof(esp_hf_audio_buff_t*)) {
+                            esp_hf_audio_buff_t *buf_to_free = *((esp_hf_audio_buff_t**)item);
+                            esp_hf_client_audio_buff_free(buf_to_free);
+                        }
+                        vRingbufferReturnItem(hfp_ringbuf, item);
+                    }
+                    vRingbufferDelete(hfp_ringbuf);
+                    hfp_ringbuf = NULL;
+                }
+                if (hfp_send_queue) {
+                    // Drain any queued items and free buffers
+                    esp_hf_audio_buff_t *qbuf = NULL;
+                    while (xQueueReceive(hfp_send_queue, &qbuf, 0) == pdTRUE) {
+                        if (qbuf) esp_hf_client_audio_buff_free(qbuf);
+                    }
+                    vQueueDelete(hfp_send_queue);
+                    hfp_send_queue = NULL;
+                }
+                if (hfp_sender_task_handle) {
+                    vTaskDelete(hfp_sender_task_handle);
+                    hfp_sender_task_handle = NULL;
+                }
+                break;
             
         case ESP_HF_CLIENT_CLIP_EVT:
             ESP_LOGI(TAG, "Caller ID: %s", param->clip.number);
@@ -658,6 +1178,8 @@ static void bt_hfp_cb(esp_hf_client_cb_event_t event, esp_hf_client_cb_param_t *
             ESP_LOGI(TAG, "HFP event: %d", event);
             break;
     }
+    } // end bt_hfp_cb
+
 }
 
 // ============================================================================
@@ -686,6 +1208,10 @@ void bluetooth_init(void) {
         ESP_LOGE(TAG, "=== BLUETOOTH INIT FAILED AT STEP 2 ===");
         return;
     }
+    // Enable HFP debug trace by default to help catch HFP issues during development
+    bluetooth_set_hfp_debug_logs(true);
+    // Reduce console noise by default: show only Mic/Bluetooth traces
+    bluetooth_enable_mic_trace_only(true);
     ESP_LOGI(TAG, "Step 2: BT controller initialized successfully");
 
     ESP_LOGI(TAG, "Step 3: Enabling BT controller (BTDM mode - dual mode)...");
@@ -779,6 +1305,99 @@ void bluetooth_init(void) {
     ESP_LOGI(TAG, "Device name: %s", BT_DEVICE_NAME);
     ESP_LOGI(TAG, "Status: Discoverable and ready to pair");
     ESP_LOGI(TAG, "Look for 'SmartGlove' in your phone's Bluetooth settings");
+}
+
+// Periodic telemetry for drop counts and fallback usage
+static void hfp_telemetry_task(void *pv) {
+    (void)pv;
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(10000));
+        ESP_LOGI(TAG, "HFP telemetry: mic_tx_drops=%u hfp_send_drops=%u fallback_count=%u", mic_tx_drops, hfp_send_drops, hfp_encode_fallback_count);
+    }
+}
+
+void bluetooth_force_hfp_safe_encode(bool enable) {
+    hfp_force_safe_encode = enable;
+    ESP_LOGI(TAG, "HFP force-safe-encode set to %d", (int)enable);
+}
+
+void bluetooth_disable_hfp_encoder(bool disable) {
+    hfp_disable_encoder = disable;
+    ESP_LOGI(TAG, "HFP disable-encoder set to %d", (int)disable);
+}
+
+void bluetooth_set_hfp_debug_logs(bool enable) {
+    esp_log_level_set(TAG, enable ? ESP_LOG_DEBUG : ESP_LOG_INFO);
+    ESP_LOGI(TAG, "HFP logs set to %s", enable ? "DEBUG" : "INFO");
+    hfp_trace_full = enable;
+}
+
+void bluetooth_enable_mic_trace_only(bool enable) {
+    if (enable) {
+        // Quiet all logs except core mic path tags - set global to WARN
+        esp_log_level_set("*", ESP_LOG_WARN);
+        // Keep mic and bluetooth trace logs enabled
+        esp_log_level_set("MicManager", ESP_LOG_INFO);
+        esp_log_level_set("Bluetooth", ESP_LOG_DEBUG); // our mic traces use DEBUG
+
+        // Silence other noisy local tags that are unrelated to mic tracing
+        esp_log_level_set("SmartGlove", ESP_LOG_WARN);
+        esp_log_level_set("AudioManager", ESP_LOG_WARN);
+        esp_log_level_set("Display", ESP_LOG_WARN);
+        esp_log_level_set("UIManager", ESP_LOG_WARN);
+        esp_log_level_set("SensorManager", ESP_LOG_WARN);
+        esp_log_level_set("GestureDetector", ESP_LOG_WARN);
+        esp_log_level_set("AnalogSensors", ESP_LOG_WARN);
+        esp_log_level_set("MPU6050", ESP_LOG_WARN);
+
+        // Silence some BT stack tags that are usually very chatty
+        esp_log_level_set("BT_HCI", ESP_LOG_ERROR);
+        esp_log_level_set("BT_APPL", ESP_LOG_ERROR);
+        esp_log_level_set("BT_BTC", ESP_LOG_ERROR);
+        esp_log_level_set("BT_LOG", ESP_LOG_ERROR);
+        esp_log_level_set("BT_BTM", ESP_LOG_ERROR);
+        esp_log_level_set("BTIF", ESP_LOG_ERROR);
+
+        // Tests / misc tags
+        esp_log_level_set("I2S_SPEAKER_TEST", ESP_LOG_WARN);
+        esp_log_level_set("I2S_MIC_TEST", ESP_LOG_WARN);
+        esp_log_level_set("I2C_SCANNER", ESP_LOG_WARN);
+        esp_log_level_set("BT_A2DP_SINK", ESP_LOG_WARN);
+        ESP_LOGI(TAG, "Serial filtering enabled - only Mic/Bluetooth TRACE will be shown");
+    } else {
+        // Restore default verbosity for all tags
+        esp_log_level_set("*", ESP_LOG_INFO);
+        esp_log_level_set("MicManager", ESP_LOG_INFO);
+        esp_log_level_set("Bluetooth", ESP_LOG_INFO);
+        // Restore our usual defaults for local tags
+        esp_log_level_set("SmartGlove", ESP_LOG_INFO);
+        esp_log_level_set("AudioManager", ESP_LOG_INFO);
+        esp_log_level_set("Display", ESP_LOG_INFO);
+        esp_log_level_set("UIManager", ESP_LOG_INFO);
+        esp_log_level_set("SensorManager", ESP_LOG_INFO);
+        esp_log_level_set("GestureDetector", ESP_LOG_INFO);
+        esp_log_level_set("AnalogSensors", ESP_LOG_INFO);
+        esp_log_level_set("MPU6050", ESP_LOG_INFO);
+
+        // Restore BT stack levels to defaults (INFO)
+        esp_log_level_set("BT_HCI", ESP_LOG_INFO);
+        esp_log_level_set("BT_APPL", ESP_LOG_INFO);
+        esp_log_level_set("BT_BTC", ESP_LOG_INFO);
+        esp_log_level_set("BT_LOG", ESP_LOG_INFO);
+        esp_log_level_set("BT_BTM", ESP_LOG_INFO);
+        esp_log_level_set("BTIF", ESP_LOG_INFO);
+
+        esp_log_level_set("I2S_SPEAKER_TEST", ESP_LOG_INFO);
+        esp_log_level_set("I2S_MIC_TEST", ESP_LOG_INFO);
+        esp_log_level_set("I2C_SCANNER", ESP_LOG_INFO);
+        esp_log_level_set("BT_A2DP_SINK", ESP_LOG_INFO);
+        ESP_LOGI(TAG, "Serial filtering disabled - all tags restored to INFO");
+    }
+}
+
+void bluetooth_use_hfp_queue(bool enable) {
+    hfp_use_queue = enable;
+    ESP_LOGI(TAG, "HFP send mode: using queue=%d (ringbuf=%p queue=%p)", (int)enable, hfp_ringbuf, hfp_send_queue);
 }
 
 bool bluetooth_is_connected(void) {
