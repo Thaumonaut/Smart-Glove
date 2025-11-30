@@ -10,6 +10,14 @@
 // ============================================================================
 // I2S AUDIO PINS (MAX98357A Speaker + INMP441 Microphone)
 // ============================================================================
+// NOISE REDUCTION TIPS:
+// 1. Keep I2S clock wires as SHORT as possible (< 10cm ideal)
+// 2. Add 100-220Ω series resistors on BCK and WS lines (slows edges, reduces EMI)
+// 3. Route clock traces away from analog sensors and sensitive circuits
+// 4. Add 100nF capacitors between BCK/WS and GND near endpoints (low-pass filter)
+// 5. Use twisted-pair or shielded cable for long runs
+// 6. If noise persists, reduce GPIO drive strength in audio_manager.cpp/mic_manager.cpp
+//
 // Speaker output (MAX98357A on I2S port 0)
 #define I2S_SPKR_BCK_IO 27  // Speaker Bit Clock
 #define I2S_SPKR_WS_IO  26  // Speaker Word Select / LRC

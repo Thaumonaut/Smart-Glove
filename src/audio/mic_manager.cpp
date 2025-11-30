@@ -86,9 +86,9 @@ esp_err_t mic_manager_init(void) {
         .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,   // Mono (L/R pin to GND)
         .communication_format = (i2s_comm_format_t)(I2S_COMM_FORMAT_STAND_I2S),
         .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-        .dma_buf_count = 4,    // 4 DMA buffers - low latency for voice
-        .dma_buf_len = 256,    // 256 samples/buffer = ~6ms latency per buffer
-        .use_apll = false,     // Use standard PLL (will match speaker's clock source)
+        .dma_buf_count = 8,    // 8 DMA buffers (increased from 4) - reduces interrupt frequency
+        .dma_buf_len = 512,    // 512 samples/buffer (increased from 256) - fewer interrupts = less noise
+        .use_apll = true,      // Use APLL for cleaner clock generation (reduces jitter)
         .tx_desc_auto_clear = false,
         .fixed_mclk = 0,
         .mclk_multiple = I2S_MCLK_MULTIPLE_256,
@@ -119,10 +119,12 @@ esp_err_t mic_manager_init(void) {
     ESP_LOGI(TAG, "*** Separate I2S clocks: BCK=GPIO%d, WS=GPIO%d, DIN=GPIO%d ***", 
              I2S_MIC_BCK_IO, I2S_MIC_WS_IO, I2S_MIC_DI_IO);
     
-    // CRITICAL FIX: Increase drive strength on clock pins to fix signal integrity
-    gpio_set_drive_capability((gpio_num_t)I2S_MIC_BCK_IO, GPIO_DRIVE_CAP_3);  // BCK: Max drive (40mA)
-    gpio_set_drive_capability((gpio_num_t)I2S_MIC_WS_IO, GPIO_DRIVE_CAP_3);   // WS: Max drive (40mA)
-    ESP_LOGI(TAG, "*** Mic clock pins set to maximum drive strength (40mA) ***");
+    // NOISE REDUCTION: Use minimum drive strength on clock pins to reduce EMI
+    // If you have signal integrity issues (choppy audio), increase to GPIO_DRIVE_CAP_1 or _2
+    gpio_set_drive_capability((gpio_num_t)I2S_MIC_BCK_IO, GPIO_DRIVE_CAP_0);  // BCK: 5mA (minimum EMI)
+    gpio_set_drive_capability((gpio_num_t)I2S_MIC_WS_IO, GPIO_DRIVE_CAP_0);   // WS: 5mA (minimum EMI)
+    ESP_LOGI(TAG, "*** Mic clock pins set to MINIMUM drive strength (5mA) to reduce noise ***");
+    ESP_LOGI(TAG, "*** If mic audio is choppy, add 100-220 ohm series resistors on BCK/WS lines ***");
     
     ESP_LOGI(TAG, "*** Dynamic sample rate: 44.1kHz normal, 16kHz during HFP calls ***");
     

@@ -8,6 +8,8 @@
 #include "esp_err.h"
 #include <stdint.h>
 
+#include "../gestures/gesture_detector.h"
+
 // Initialize UI system
 esp_err_t ui_manager_init(void);
 
@@ -19,5 +21,8 @@ void ui_update_accel(int16_t accel_x, int16_t accel_y, int16_t accel_z);
 
 // Update all UI elements (call from main loop)
 void ui_update_all(void);
+
+// Record latest gesture for display
+void ui_set_gesture(gesture_type_t gesture);
 
 #endif // UI_MANAGER_H

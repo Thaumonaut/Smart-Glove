@@ -26,6 +26,13 @@ static lv_obj_t *label_track_info;
 static lv_obj_t *label_accel_x;
 static lv_obj_t *label_accel_y;
 static lv_obj_t *label_accel_z;
+static lv_obj_t *label_gyro_x;
+static lv_obj_t *label_gyro_y;
+static lv_obj_t *label_gyro_z;
+static lv_obj_t *label_health;
+static lv_obj_t *label_gesture;
+static lv_obj_t *label_apds_prox;
+static lv_obj_t *label_apds_dir;
 static lv_obj_t *label_message;
 
 // SPI device handle
@@ -267,6 +274,48 @@ void display_init(void) {
     lv_obj_set_style_text_color(label_accel_z, lv_color_make(255, 200, 100), 0);
     lv_obj_align(label_accel_z, LV_ALIGN_BOTTOM_RIGHT, -5, -25);
 
+    // Gyroscope values (slightly above accelerometer)
+    label_gyro_x = lv_label_create(scr);
+    lv_label_set_text(label_gyro_x, "GX:0");
+    lv_obj_set_style_text_color(label_gyro_x, lv_color_make(150, 150, 255), 0);
+    lv_obj_align(label_gyro_x, LV_ALIGN_BOTTOM_LEFT, 5, -45);
+
+    label_gyro_y = lv_label_create(scr);
+    lv_label_set_text(label_gyro_y, "GY:0");
+    lv_obj_set_style_text_color(label_gyro_y, lv_color_make(150, 255, 150), 0);
+    lv_obj_align(label_gyro_y, LV_ALIGN_BOTTOM_MID, 0, -45);
+
+    label_gyro_z = lv_label_create(scr);
+    lv_label_set_text(label_gyro_z, "GZ:0");
+    lv_obj_set_style_text_color(label_gyro_z, lv_color_make(255, 150, 150), 0);
+    lv_obj_align(label_gyro_z, LV_ALIGN_BOTTOM_RIGHT, -5, -45);
+
+    // Health status (HR/SpO2 or raw values)
+    label_health = lv_label_create(scr);
+    lv_label_set_text(label_health, "HR: -- bpm  SpO2: -- %");
+    lv_obj_set_style_text_color(label_health, lv_color_make(200, 200, 255), 0);
+    lv_obj_set_style_text_align(label_health, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(label_health, LV_ALIGN_TOP_MID, 0, 65);
+
+    // Gesture indicator
+    label_gesture = lv_label_create(scr);
+    lv_label_set_text(label_gesture, "Gesture: None");
+    lv_obj_set_style_text_color(label_gesture, lv_color_make(255, 220, 150), 0);
+    lv_obj_set_style_text_align(label_gesture, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(label_gesture, LV_ALIGN_TOP_MID, 0, 85);
+    
+    // APDS9960 proximity
+    label_apds_prox = lv_label_create(scr);
+    lv_label_set_text(label_apds_prox, "Prox: --");
+    lv_obj_set_style_text_color(label_apds_prox, lv_color_make(180, 255, 180), 0);
+    lv_obj_align(label_apds_prox, LV_ALIGN_TOP_MID, 0, 105);
+    
+    // APDS9960 gesture direction
+    label_apds_dir = lv_label_create(scr);
+    lv_label_set_text(label_apds_dir, "Dir: --");
+    lv_obj_set_style_text_color(label_apds_dir, lv_color_make(255, 180, 255), 0);
+    lv_obj_align(label_apds_dir, LV_ALIGN_TOP_MID, 0, 125);
+
     // Message label
     label_message = lv_label_create(scr);
     lv_label_set_text(label_message, "");
@@ -306,6 +355,21 @@ void display_update_accel(int16_t x, int16_t y, int16_t z) {
     lv_label_set_text(label_accel_z, buf);
     
     // Force immediate screen refresh
+    lv_refr_now(NULL);
+}
+
+void display_update_gyro(int16_t x, int16_t y, int16_t z) {
+    char buf[32];
+
+    snprintf(buf, sizeof(buf), "GX:%d", x);
+    lv_label_set_text(label_gyro_x, buf);
+
+    snprintf(buf, sizeof(buf), "GY:%d", y);
+    lv_label_set_text(label_gyro_y, buf);
+
+    snprintf(buf, sizeof(buf), "GZ:%d", z);
+    lv_label_set_text(label_gyro_z, buf);
+
     lv_refr_now(NULL);
 }
 
@@ -374,6 +438,55 @@ void display_update_bluetooth_state(bool connected, bool playing, bool in_call,
 
 void display_show_message(const char *message) {
     lv_label_set_text(label_message, message);
+}
+
+void display_update_health(bool valid, float heart_rate, float spo2,
+                           uint32_t red_led, uint32_t ir_led) {
+    char buf[64];
+    if (valid) {
+        if (heart_rate > 0.0f && spo2 > 0.0f) {
+            snprintf(buf, sizeof(buf), "HR: %.0f bpm  SpO2: %.0f%%", heart_rate, spo2);
+        } else {
+            snprintf(buf, sizeof(buf), "Red:%lu  IR:%lu", (unsigned long)red_led, (unsigned long)ir_led);
+        }
+    } else {
+        snprintf(buf, sizeof(buf), "HR: -- bpm  SpO2: -- %%");
+    }
+    lv_label_set_text(label_health, buf);
+    lv_obj_invalidate(label_health);
+    lv_refr_now(NULL);
+}
+
+void display_update_gesture(const char *gesture_text) {
+    if (gesture_text == NULL || gesture_text[0] == '\0') {
+        lv_label_set_text(label_gesture, "Gesture: None");
+    } else {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "Gesture: %s", gesture_text);
+        lv_label_set_text(label_gesture, buf);
+    }
+    lv_obj_invalidate(label_gesture);
+    lv_refr_now(NULL);
+}
+
+void display_update_apds_proximity(uint8_t proximity) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "Prox: %d", proximity);
+    lv_label_set_text(label_apds_prox, buf);
+    lv_obj_invalidate(label_apds_prox);
+    lv_refr_now(NULL);
+}
+
+void display_update_apds_gesture(const char *gesture_dir) {
+    char buf[32];
+    if (gesture_dir && gesture_dir[0] != '\0') {
+        snprintf(buf, sizeof(buf), "Dir: %s", gesture_dir);
+    } else {
+        snprintf(buf, sizeof(buf), "Dir: --");
+    }
+    lv_label_set_text(label_apds_dir, buf);
+    lv_obj_invalidate(label_apds_dir);
+    lv_refr_now(NULL);
 }
 
 void display_lvgl_tick(void) {

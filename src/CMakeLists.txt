@@ -7,6 +7,8 @@ idf_component_register(
         "display.cpp"
         "bluetooth.cpp"
         "sensors/mpu6050.cpp"
+        "sensors/max30102.cpp"
+        "sensors/apds9960.cpp"
         "sensors/analog_sensors.cpp"
         "sensors/sensor_manager.cpp"
         "gestures/gesture_detector.cpp"

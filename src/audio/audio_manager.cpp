@@ -51,18 +51,18 @@ esp_err_t audio_manager_init(void) {
     ESP_LOGI(TAG, "*** MAX98357A GAIN pin: GPIO5 = HIGH (15dB gain - MAXIMUM) ***");
     
     // I2S configuration for speaker (port 0)
-    // TDM Mode: Shares BCK/WS clocks with mic (port 1) via GPIO matrix
+    // Separate clocks from microphone (no TDM sharing)
     // DMA handles data transfer without CPU intervention
     i2s_config_t i2s_speaker_config = {
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),  // Master generates clocks
-        .sample_rate = 44100,  // 44.1kHz for music/A2DP (mic will match & downsample)
+        .sample_rate = 44100,  // 44.1kHz for music/A2DP
         .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
         .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
         .communication_format = (i2s_comm_format_t)(I2S_COMM_FORMAT_STAND_I2S),
         .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
         .dma_buf_count = 8,    // 8 DMA buffers for smooth playback
-        .dma_buf_len = 256,    // 256 samples/buffer = ~6ms latency per buffer
-        .use_apll = false,     // Standard PLL (must match mic for TDM sync)
+        .dma_buf_len = 512,    // 512 samples/buffer (increased) - reduces interrupt frequency & noise
+        .use_apll = true,      // Use APLL for cleaner clock (reduces jitter/noise)
         .tx_desc_auto_clear = true,
         .fixed_mclk = 0,
         .mclk_multiple = I2S_MCLK_MULTIPLE_256,
@@ -91,12 +91,14 @@ esp_err_t audio_manager_init(void) {
     }
     ESP_LOGI(TAG, "*** I2S pins: BCK=GPIO%d, WS=GPIO%d, DOUT=GPIO%d ***", I2S_BCK_IO, I2S_WS_IO, I2S_SPKR_DO_IO);
     
-    // CRITICAL FIX: Increase drive strength on clock pins to fix signal integrity
-    // Without this, clock signals can be weak/unstable with long wires
-    gpio_set_drive_capability((gpio_num_t)I2S_BCK_IO, GPIO_DRIVE_CAP_3);   // BCK: Max drive (40mA)
-    gpio_set_drive_capability((gpio_num_t)I2S_WS_IO, GPIO_DRIVE_CAP_3);    // WS: Max drive (40mA)
-    gpio_set_drive_capability((gpio_num_t)I2S_SPKR_DO_IO, GPIO_DRIVE_CAP_3); // DOUT: Max drive
-    ESP_LOGI(TAG, "*** Clock pins set to maximum drive strength (40mA) ***");
+    // NOISE REDUCTION: Use moderate drive strength on clock pins
+    // Lower drive = less EMI, but signal integrity may suffer with long wires
+    // If audio is choppy/distorted, increase to GPIO_DRIVE_CAP_2 or _3
+    gpio_set_drive_capability((gpio_num_t)I2S_BCK_IO, GPIO_DRIVE_CAP_1);   // BCK: 10mA (balanced)
+    gpio_set_drive_capability((gpio_num_t)I2S_WS_IO, GPIO_DRIVE_CAP_1);    // WS: 10mA (balanced)
+    gpio_set_drive_capability((gpio_num_t)I2S_SPKR_DO_IO, GPIO_DRIVE_CAP_2); // DOUT: 20mA (data needs more)
+    ESP_LOGI(TAG, "*** Clock pins set to MODERATE drive strength (10mA) to reduce EMI ***");
+    ESP_LOGI(TAG, "*** Hardware fix: Add 100-220 ohm series resistors on BCK/WS if noise persists ***");
     
     // Set I2S clock for better audio quality
     i2s_set_clk(I2S_PORT_SPEAKER, 44100, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO);

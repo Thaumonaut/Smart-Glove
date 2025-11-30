@@ -128,21 +128,26 @@ static void on_gesture_detected(gesture_type_t gesture) {
     switch (gesture) {
         case GESTURE_CALL_ME:
             ESP_LOGI(TAG, "Gesture detected: CALL ME");
+            ui_set_gesture(gesture);
             // TODO: Trigger phone call
             break;
         case GESTURE_EMERGENCY_SHAKE:
             ESP_LOGI(TAG, "Gesture detected: EMERGENCY");
+            ui_set_gesture(gesture);
             // TODO: Send emergency alert
             break;
         case GESTURE_SWIPE_UP:
             ESP_LOGI(TAG, "Gesture detected: SWIPE UP");
+            ui_set_gesture(gesture);
             // TODO: Navigate menu up
             break;
         case GESTURE_SWIPE_DOWN:
             ESP_LOGI(TAG, "Gesture detected: SWIPE DOWN");
+            ui_set_gesture(gesture);
             // TODO: Navigate menu down
             break;
         default:
+            ui_set_gesture(GESTURE_NONE);
             break;
     }
 }
